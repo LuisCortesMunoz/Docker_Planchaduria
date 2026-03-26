@@ -20,7 +20,7 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 
 # Step 4: Firebase config
 # Debes subir serviceAccountKey.json al backend de Render
-FIREBASE_CRED_FILE = "serviceAccountKey.json"
+FIREBASE_CRED_FILE =  "/etc/secrets/serviceAccountKey.json"
 FIREBASE_DB_URL = "https://pruebaconexion-65273-default-rtdb.firebaseio.com/"
 
 if not firebase_admin._apps:
