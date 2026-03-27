@@ -1,28 +1,23 @@
-
----
-
-# 5) `README_RENDER.md`
-
-```md
 # Deploy en Render
 
-## 1. Subir archivos al repositorio
-Sube:
+## Archivos en el repo
 - app.py
 - requirements.txt
 - Dockerfile
-- serviceAccountKey.json
 
-## 2. Crear servicio en Render
-- New Web Service
-- Conectar repositorio GitHub
-- Environment: Docker
+## Firebase key
+No subir `serviceAccountKey.json` al repositorio.
 
-## 3. Importante
-El archivo `serviceAccountKey.json` debe existir dentro del proyecto.
+Subirla en Render así:
 
-## 4. URL final
-Render te dará una URL tipo:
-https://tu-backend.onrender.com
+1. Entrar al servicio web
+2. Ir a Settings
+3. Buscar Environment
+4. En Secret Files, agregar un archivo con nombre:
+   serviceAccountKey.json
+5. Pegar el contenido completo del JSON
+6. Guardar
+7. Hacer redeploy
 
-Esa URL será la que use el frontend de GitHub.
+## Ruta usada en el código
+/etc/secrets/serviceAccountKey.json
