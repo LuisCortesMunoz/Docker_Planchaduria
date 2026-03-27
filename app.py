@@ -20,7 +20,7 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 # Step 4: Firebase config
 FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
-FIREBASE_DB_URL = "https://practicaplc-4c90b-default-rtdb.firebaseio.com/"
+FIREBASE_DB_URL = "https://pruebaconexion-65273-default-rtdb.firebaseio.com/"
 
 print("Checking Firebase credential file...")
 print("Path:", FIREBASE_CRED_FILE)
