@@ -5,6 +5,7 @@ import firebase_admin
 from firebase_admin import credentials, db
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 CORS(app)
@@ -186,7 +187,7 @@ def subir_foto():
     if archivo.filename == "":
         return jsonify({"ok": False, "message": "Archivo vacío"}), 400
 
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("America/Mexico_City"))
     fecha = now.strftime("%Y-%m-%d")
     hora = now.strftime("%H:%M:%S")
     stamp = now.strftime("%Y%m%d_%H%M%S")
