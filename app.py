@@ -16,7 +16,7 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
-FIREBASE_DB_URL = "https://pruebaconexion-65273-default-rtdb.firebaseio.com/"
+FIREBASE_DB_URL = "https://practicaplc-4c90b-default-rtdb.firebaseio.com/"
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -30,23 +30,23 @@ fotos_ref = db.reference("fotos")
 
 estado_memoria = {
     "usuario_actual": "",
-    "activo": False,
     "cantidad": 0,
+    "activo": False,
     "estado": "Esperando trabajo",
     "updated_at": None
 }
 
-def guardar_estado(usuario=None, activo=None, cantidad=None, estado=None):
+def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
     global estado_memoria
 
     if usuario is not None:
         estado_memoria["usuario_actual"] = str(usuario)
 
-    if activo is not None:
-        estado_memoria["activo"] = activo
-
     if cantidad is not None:
-        estado_memoria["cantidad"] = cantidad
+        estado_memoria["cantidad"] = int(cantidad)
+
+    if activo is not None:
+        estado_memoria["activo"] = bool(activo)
 
     if estado is not None:
         estado_memoria["estado"] = estado
@@ -57,8 +57,8 @@ def guardar_estado(usuario=None, activo=None, cantidad=None, estado=None):
 
     historial_ref.push({
         "usuario_actual": estado_memoria["usuario_actual"],
-        "activo": estado_memoria["activo"],
         "cantidad": estado_memoria["cantidad"],
+        "activo": estado_memoria["activo"],
         "estado": estado_memoria["estado"],
         "timestamp": estado_memoria["updated_at"]
     })
@@ -78,17 +78,7 @@ cargar_estado()
 def home():
     return jsonify({
         "ok": True,
-        "message": "Backend Render activo",
-        "endpoints": [
-            "/estado",
-            "/set_usuario",
-            "/set_cantidad",
-            "/activar_plc",
-            "/desactivar_plc",
-            "/subir_foto",
-            "/fotos_usuario/<usuario>",
-            "/fotos/<nombre_archivo>"
-        ]
+        "message": "Backend Render activo"
     })
 
 @app.route("/estado", methods=["GET"])
@@ -122,27 +112,28 @@ def set_usuario():
 def set_cantidad():
     data = request.get_json(silent=True)
 
-    if not data or "cantidad" not in data or "usuario" not in data:
+    if not data or "usuario" not in data or "cantidad" not in data:
         return jsonify({"ok": False, "message": "Debes enviar usuario y cantidad"}), 400
 
     usuario = str(data.get("usuario")).strip()
     cantidad = data.get("cantidad")
 
     if not usuario.isdigit() or len(usuario) > 5:
-        return jsonify({"ok": False, "message": "Usuario inválido, máximo 5 dígitos"}), 400
+        return jsonify({"ok": False, "message": "Usuario inválido"}), 400
 
-    if not isinstance(cantidad, int) or cantidad <= 0:
+    if not isinstance(cantidad, int) or cantidad < 0:
         return jsonify({"ok": False, "message": "Cantidad inválida"}), 400
 
     guardar_estado(
         usuario=usuario,
         cantidad=cantidad,
+        activo=(cantidad > 0),
         estado=f"Usuario {usuario}: cantidad actualizada a {cantidad}"
     )
 
     return jsonify({
         "ok": True,
-        "message": "Cantidad enviada a la base de datos",
+        "message": "Cantidad actualizada correctamente",
         "data": estado_memoria
     })
 
@@ -155,18 +146,15 @@ def activar_plc():
 
     usuario = str(data.get("usuario")).strip()
 
-    if not usuario.isdigit() or len(usuario) > 5:
-        return jsonify({"ok": False, "message": "Usuario inválido, máximo 5 dígitos"}), 400
-
     guardar_estado(
         usuario=usuario,
         activo=True,
-        estado=f"Proceso activo para usuario {usuario}"
+        estado=f"Motor continuo activo para usuario {usuario}"
     )
 
     return jsonify({
         "ok": True,
-        "message": f"PLC activado para usuario {usuario}",
+        "message": "PLC activado correctamente",
         "data": estado_memoria
     })
 
@@ -174,7 +162,7 @@ def activar_plc():
 def desactivar_plc():
     guardar_estado(
         activo=False,
-        estado="Proceso desactivado"
+        estado="PLC desactivado"
     )
 
     return jsonify({
@@ -191,7 +179,7 @@ def subir_foto():
     usuario = str(request.form.get("usuario", "")).strip()
 
     if not usuario.isdigit() or len(usuario) > 5:
-        return jsonify({"ok": False, "message": "Usuario inválido, máximo 5 dígitos"}), 400
+        return jsonify({"ok": False, "message": "Usuario inválido"}), 400
 
     archivo = request.files["foto"]
 
@@ -215,6 +203,7 @@ def subir_foto():
         "ruta": f"/fotos/{nombre_final}",
         "fecha": fecha,
         "hora": hora,
+        "etiqueta": f"{usuario}_{fecha}_{hora}",
         "timestamp": now.isoformat()
     }
 
@@ -244,7 +233,8 @@ def fotos_usuario(usuario):
                     "nombre": foto.get("nombre", ""),
                     "url": foto.get("ruta", ""),
                     "fecha": foto.get("fecha", ""),
-                    "hora": foto.get("hora", "")
+                    "hora": foto.get("hora", ""),
+                    "etiqueta": foto.get("etiqueta", "")
                 })
 
     lista.sort(key=lambda x: x["nombre"], reverse=True)
@@ -259,6 +249,14 @@ def fotos_usuario(usuario):
 @app.route("/fotos/<nombre_archivo>", methods=["GET"])
 def ver_foto(nombre_archivo):
     return send_from_directory(app.config["UPLOAD_FOLDER"], nombre_archivo)
+
+@app.route("/historial", methods=["GET"])
+def historial():
+    data = historial_ref.get()
+    return jsonify({
+        "ok": True,
+        "data": data if data else {}
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
