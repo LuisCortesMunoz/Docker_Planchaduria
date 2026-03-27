@@ -1,5 +1,5 @@
 # Step 1: Import libraries
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import firebase_admin
@@ -7,7 +7,7 @@ from firebase_admin import credentials, db
 import os
 from datetime import datetime
 
-# Step 2: Create app
+# Step 2: Create Flask app
 app = Flask(__name__)
 CORS(app)
 
@@ -16,12 +16,15 @@ UPLOAD_FOLDER = "fotos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 # Step 4: Firebase config
-# Debes subir serviceAccountKey.json al backend de Render
-FIREBASE_CRED_FILE =  "/etc/secrets/serviceAccountKey.json"
-FIREBASE_DB_URL = "https://pruebaconexion-65273-default-rtdb.firebaseio.com/"
+FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
+FIREBASE_DB_URL = "https://practicaplc-4c90b-default-rtdb.firebaseio.com/"
+
+print("Checking Firebase credential file...")
+print("Path:", FIREBASE_CRED_FILE)
+print("Exists:", os.path.exists(FIREBASE_CRED_FILE))
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -29,11 +32,12 @@ if not firebase_admin._apps:
         "databaseURL": FIREBASE_DB_URL
     })
 
+# Step 5: Firebase references
 estado_ref = db.reference("estado_actual")
 historial_ref = db.reference("historial")
 fotos_ref = db.reference("fotos")
 
-# Step 5: Default state
+# Step 6: Default state
 estado_memoria = {
     "activo": False,
     "cantidad": 0,
@@ -41,7 +45,14 @@ estado_memoria = {
     "updated_at": None
 }
 
-# Step 6: Helper to save state
+# Step 7: Load state from Firebase
+def cargar_estado():
+    global estado_memoria
+    data = estado_ref.get()
+    if data:
+        estado_memoria = data
+
+# Step 8: Save state
 def guardar_estado(activo=None, cantidad=None, estado=None):
     global estado_memoria
 
@@ -65,17 +76,10 @@ def guardar_estado(activo=None, cantidad=None, estado=None):
         "timestamp": estado_memoria["updated_at"]
     })
 
-# Step 7: Load current state from Firebase at startup
-def cargar_estado():
-    global estado_memoria
-    data = estado_ref.get()
-    if data:
-        estado_memoria = data
-
 cargar_estado()
 
 # =========================================================
-# Step 8: Routes
+# Step 9: Routes
 # =========================================================
 
 @app.route("/", methods=["GET"])
@@ -83,12 +87,12 @@ def home():
     return jsonify({
         "ok": True,
         "message": "Backend Render activo",
+        "firebase_key_exists": os.path.exists(FIREBASE_CRED_FILE),
         "endpoints": [
             "/estado",
-            "/set_estado",
             "/set_cantidad",
-            "/activar",
-            "/desactivar",
+            "/activar_plc",
+            "/desactivar_plc",
             "/subir_foto",
             "/fotos",
             "/historial"
@@ -102,79 +106,76 @@ def obtener_estado():
         "data": estado_memoria
     })
 
-@app.route("/set_estado", methods=["POST"])
-def set_estado():
-    data = request.get_json(silent=True)
-
-    if not data:
-        return jsonify({"ok": False, "message": "JSON inválido"}), 400
-
-    activo = data.get("activo")
-    cantidad = data.get("cantidad")
-    estado = data.get("estado")
-
-    if activo is not None and not isinstance(activo, bool):
-        return jsonify({"ok": False, "message": "activo debe ser true o false"}), 400
-
-    if cantidad is not None:
-        if not isinstance(cantidad, int) or cantidad < 0:
-            return jsonify({"ok": False, "message": "cantidad debe ser entero >= 0"}), 400
-
-    guardar_estado(activo=activo, cantidad=cantidad, estado=estado)
-
-    return jsonify({
-        "ok": True,
-        "message": "Estado actualizado",
-        "data": estado_memoria
-    })
-
 @app.route("/set_cantidad", methods=["POST"])
 def set_cantidad():
     data = request.get_json(silent=True)
 
     if not data or "cantidad" not in data:
-        return jsonify({"ok": False, "message": "Debes enviar cantidad"}), 400
+        return jsonify({
+            "ok": False,
+            "message": "Debes enviar cantidad"
+        }), 400
 
     cantidad = data.get("cantidad")
 
     if not isinstance(cantidad, int) or cantidad < 0:
-        return jsonify({"ok": False, "message": "Cantidad inválida"}), 400
+        return jsonify({
+            "ok": False,
+            "message": "Cantidad inválida"
+        }), 400
 
-    guardar_estado(cantidad=cantidad, estado=f"Cantidad actualizada a {cantidad}")
+    guardar_estado(
+        cantidad=cantidad,
+        estado=f"Cantidad actualizada a {cantidad}"
+    )
 
     return jsonify({
         "ok": True,
-        "message": "Cantidad actualizada",
+        "message": "Cantidad enviada a la base de datos",
         "data": estado_memoria
     })
 
-@app.route("/activar", methods=["POST"])
-def activar():
-    guardar_estado(activo=True, estado="Motor activo")
+@app.route("/activar_plc", methods=["POST"])
+def activar_plc():
+    guardar_estado(
+        activo=True,
+        estado="PLC activado"
+    )
+
     return jsonify({
         "ok": True,
-        "message": "Sistema activado",
+        "message": "PLC activado correctamente",
         "data": estado_memoria
     })
 
-@app.route("/desactivar", methods=["POST"])
-def desactivar():
-    guardar_estado(activo=False, estado="Motor detenido")
+@app.route("/desactivar_plc", methods=["POST"])
+def desactivar_plc():
+    guardar_estado(
+        activo=False,
+        estado="PLC desactivado"
+    )
+
     return jsonify({
         "ok": True,
-        "message": "Sistema desactivado",
+        "message": "PLC desactivado correctamente",
         "data": estado_memoria
     })
 
 @app.route("/subir_foto", methods=["POST"])
 def subir_foto():
     if "foto" not in request.files:
-        return jsonify({"ok": False, "message": "No se recibió archivo"}), 400
+        return jsonify({
+            "ok": False,
+            "message": "No se recibió archivo"
+        }), 400
 
     archivo = request.files["foto"]
 
     if archivo.filename == "":
-        return jsonify({"ok": False, "message": "Archivo vacío"}), 400
+        return jsonify({
+            "ok": False,
+            "message": "Archivo vacío"
+        }), 400
 
     nombre_seguro = secure_filename(archivo.filename)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -216,7 +217,6 @@ def listar_fotos():
 
 @app.route("/fotos/<nombre_archivo>", methods=["GET"])
 def ver_foto(nombre_archivo):
-    from flask import send_from_directory
     return send_from_directory(app.config["UPLOAD_FOLDER"], nombre_archivo)
 
 @app.route("/historial", methods=["GET"])
@@ -228,7 +228,7 @@ def ver_historial():
     })
 
 # =========================================================
-# Step 9: Run
+# Step 10: Run app
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
