@@ -16,7 +16,7 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
-FIREBASE_DB_URL = "https://practicaplc-4c90b-default-rtdb.firebaseio.com/"
+FIREBASE_DB_URL = "https://pruebaconexion-65273-default-rtdb.firebaseio.com/"
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
