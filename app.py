@@ -1,45 +1,39 @@
-# =========================================================
-# Planchado Express - Backend Render
-# =========================================================
-
 import os
 import io
-import json
-import base64
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
-
+from firebase_admin import credentials, auth, firestore, initialize_app, storage
 import firebase_admin
-from firebase_admin import credentials, auth, firestore, storage, initialize_app
 
 # =========================================================
-# CONFIG GENERAL
+# CONFIG
 # =========================================================
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
+FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
+FIREBASE_WEB_API_KEY = os.environ["FIREBASE_WEB_API_KEY"]
 SESSION_COOKIE_NAME = "pe_session"
 SESSION_DAYS = 7
 
-PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "db-planchaduria")
-STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "db-planchaduria.firebasestorage.app")
-ADMIN_UID = os.environ.get("ADMIN_UID", "HrGtBnzEtBXLK19YpeI8wTAaSM42")
+PROJECT_ID = "db-planchaduria"
+STORAGE_BUCKET = "db-planchaduria.firebasestorage.app"
+ADMIN_UID = "HrGtBnzEtBXLK19YpeI8wTAaSM42"
 
-# Para login por email/password con Firebase Auth REST
-FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "").strip()
+if not firebase_admin._apps:
+    cred = credentials.Certificate(FIREBASE_CRED_FILE)
+    initialize_app(cred, {"storageBucket": STORAGE_BUCKET})
 
-# Ruta opcional si usas Secret File
-FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
-
-db = None
-bucket = None
+db = firestore.client()
+bucket = storage.bucket()
 
 # =========================================================
-# HELPERS DE TIEMPO
+# HELPERS
 # =========================================================
 def mexico_now():
     return datetime.now(ZoneInfo("America/Mexico_City"))
@@ -47,113 +41,16 @@ def mexico_now():
 def json_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
 
-# =========================================================
-# SERIALIZACIÓN FIRESTORE
-# =========================================================
-def serialize_firestore_value(value):
-    if value is None:
-        return None
-
-    if isinstance(value, dict):
-        return {k: serialize_firestore_value(v) for k, v in value.items()}
-
-    if isinstance(value, list):
-        return [serialize_firestore_value(v) for v in value]
-
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            pass
-
-    return value
-
-def serialize_firestore_doc(data):
-    if not data:
-        return {}
-    return {k: serialize_firestore_value(v) for k, v in data.items()}
-
-# =========================================================
-# CARGA DE FIREBASE
-# =========================================================
-def load_firebase_credential():
-    """
-    Intenta cargar credenciales en este orden:
-    1) FIREBASE_SERVICE_ACCOUNT_JSON
-    2) FIREBASE_SERVICE_ACCOUNT_B64
-    3) /etc/secrets/serviceAccountKey.json
-    """
-    json_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    b64_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
-
-    if json_env:
-        print("✅ Usando FIREBASE_SERVICE_ACCOUNT_JSON desde Environment")
-        data = json.loads(json_env)
-        return credentials.Certificate(data)
-
-    if b64_env:
-        print("✅ Usando FIREBASE_SERVICE_ACCOUNT_B64 desde Environment")
-        decoded = base64.b64decode(b64_env).decode("utf-8")
-        data = json.loads(decoded)
-        return credentials.Certificate(data)
-
-    if os.path.exists(FIREBASE_CRED_FILE):
-        print(f"✅ Usando Secret File: {FIREBASE_CRED_FILE}")
-        return credentials.Certificate(FIREBASE_CRED_FILE)
-
-    raise RuntimeError(
-        "No se encontró la credencial de Firebase. "
-        "Usa FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_SERVICE_ACCOUNT_B64 "
-        "o un Secret File en /etc/secrets/serviceAccountKey.json"
-    )
-
-def init_firebase():
-    global db, bucket
-
-    print("========================================")
-    print("Iniciando backend de Planchado Express")
-    print("PROJECT_ID:", PROJECT_ID)
-    print("STORAGE_BUCKET:", STORAGE_BUCKET)
-    print("Existe FIREBASE_WEB_API_KEY:", bool(FIREBASE_WEB_API_KEY))
-    print("Existe FIREBASE_SERVICE_ACCOUNT_JSON:", bool(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")))
-    print("Existe FIREBASE_SERVICE_ACCOUNT_B64:", bool(os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64")))
-    print("Existe Secret File:", os.path.exists(FIREBASE_CRED_FILE))
-    print("========================================")
-
-    cred = load_firebase_credential()
-
-    if not firebase_admin._apps:
-        initialize_app(cred, {
-            "storageBucket": STORAGE_BUCKET
-        })
-
-    db = firestore.client()
-    bucket = storage.bucket()
-
-    print("✅ Firebase inicializado correctamente")
-
-try:
-    init_firebase()
-except Exception as e:
-    print("❌ ERROR AL INICIALIZAR FIREBASE:", repr(e))
-    raise
-
-# =========================================================
-# HELPERS DE SESIÓN
-# =========================================================
 def get_session_user():
     session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
     if not session_cookie:
         return None
-
     try:
         decoded = auth.verify_session_cookie(session_cookie, check_revoked=False)
         uid = decoded["uid"]
         user = auth.get_user(uid)
-
         user_doc = db.collection("usuarios").document(uid).get()
         user_data = user_doc.to_dict() if user_doc.exists else {}
-
         return {
             "uid": uid,
             "email": user.email,
@@ -161,10 +58,9 @@ def get_session_user():
             "nombre": user_data.get("nombre", ""),
             "apellido": user_data.get("apellido", ""),
             "telefono": user_data.get("telefono", ""),
-            "nombreCompleto": f"{user_data.get('nombre', '')} {user_data.get('apellido', '')}".strip()
+            "nombreCompleto": f"{user_data.get('nombre','')} {user_data.get('apellido','')}".strip()
         }
-    except Exception as e:
-        print("Error verificando sesión:", repr(e))
+    except Exception:
         return None
 
 def require_auth():
@@ -181,15 +77,10 @@ def require_admin():
         return None, json_error("No autorizado", 403)
     return user, None
 
-def create_session_response(id_token, user_payload):
+def create_session_response(id_token):
     expires_in = timedelta(days=SESSION_DAYS)
     session_cookie = auth.create_session_cookie(id_token, expires_in=expires_in)
-
-    resp = make_response(jsonify({
-        "ok": True,
-        "user": user_payload
-    }))
-
+    resp = make_response(jsonify({"ok": True, "message": "Sesión iniciada"}))
     resp.set_cookie(
         SESSION_COOKIE_NAME,
         session_cookie,
@@ -201,30 +92,18 @@ def create_session_response(id_token, user_payload):
     )
     return resp
 
-# =========================================================
-# HELPERS AUTH EMAIL/PASSWORD
-# =========================================================
 def sign_in_email_password(email, password):
-    if not FIREBASE_WEB_API_KEY:
-        raise RuntimeError("Falta FIREBASE_WEB_API_KEY en Environment")
-
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_WEB_API_KEY}"
     r = requests.post(url, json={
         "email": email,
         "password": password,
         "returnSecureToken": True
     }, timeout=20)
-
     data = r.json()
-
     if not r.ok:
         raise RuntimeError(data.get("error", {}).get("message", "Error de login"))
-
     return data
 
-# =========================================================
-# HELPERS STORAGE / NEGOCIO
-# =========================================================
 def upload_photo_to_storage(file_bytes: bytes, file_name: str, content_type: str = "image/jpeg"):
     blob = bucket.blob(f"pedidos/{file_name}")
     blob.upload_from_file(io.BytesIO(file_bytes), content_type=content_type)
@@ -238,31 +117,11 @@ def next_folio():
     return folio, contador
 
 # =========================================================
-# HEALTH
-# =========================================================
-@app.get("/")
-def home():
-    return jsonify({
-        "ok": True,
-        "message": "Backend activo",
-        "projectId": PROJECT_ID,
-        "storageBucket": STORAGE_BUCKET
-    })
-
-@app.get("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "firebase": True
-    })
-
-# =========================================================
 # AUTH
 # =========================================================
 @app.post("/auth/register")
 def auth_register():
     data = request.get_json(silent=True) or {}
-
     nombre = data.get("nombre", "").strip()
     apellido = data.get("apellido", "").strip()
     email = data.get("email", "").strip()
@@ -271,13 +130,11 @@ def auth_register():
 
     if not nombre or not apellido or not email or not password:
         return json_error("Completa todos los campos obligatorios")
-
     if len(password) < 6:
         return json_error("La contraseña debe tener al menos 6 caracteres")
 
     try:
         user = auth.create_user(email=email, password=password)
-
         db.collection("usuarios").document(user.uid).set({
             "uid": user.uid,
             "nombre": nombre,
@@ -288,26 +145,26 @@ def auth_register():
         })
 
         login_data = sign_in_email_password(email, password)
-
-        user_payload = {
-            "uid": user.uid,
-            "email": email,
-            "isAdmin": user.uid == ADMIN_UID,
-            "nombre": nombre,
-            "apellido": apellido,
-            "telefono": telefono,
-            "nombreCompleto": f"{nombre} {apellido}".strip()
-        }
-
-        return create_session_response(login_data["idToken"], user_payload)
-
+        resp = create_session_response(login_data["idToken"])
+        resp.set_data(jsonify({
+            "ok": True,
+            "user": {
+                "uid": user.uid,
+                "email": email,
+                "isAdmin": user.uid == ADMIN_UID,
+                "nombre": nombre,
+                "apellido": apellido,
+                "telefono": telefono,
+                "nombreCompleto": f"{nombre} {apellido}".strip()
+            }
+        }).get_data())
+        return resp
     except Exception as e:
         return json_error(str(e), 400)
 
 @app.post("/auth/login")
 def auth_login():
     data = request.get_json(silent=True) or {}
-
     email = data.get("email", "").strip()
     password = data.get("password", "")
 
@@ -317,23 +174,24 @@ def auth_login():
     try:
         login_data = sign_in_email_password(email, password)
         uid = login_data["localId"]
-
         user_record = auth.get_user(uid)
         user_doc = db.collection("usuarios").document(uid).get()
         u = user_doc.to_dict() if user_doc.exists else {}
 
-        user_payload = {
-            "uid": uid,
-            "email": user_record.email,
-            "isAdmin": uid == ADMIN_UID,
-            "nombre": u.get("nombre", ""),
-            "apellido": u.get("apellido", ""),
-            "telefono": u.get("telefono", ""),
-            "nombreCompleto": f"{u.get('nombre', '')} {u.get('apellido', '')}".strip()
-        }
-
-        return create_session_response(login_data["idToken"], user_payload)
-
+        resp = create_session_response(login_data["idToken"])
+        resp.set_data(jsonify({
+            "ok": True,
+            "user": {
+                "uid": uid,
+                "email": user_record.email,
+                "isAdmin": uid == ADMIN_UID,
+                "nombre": u.get("nombre", ""),
+                "apellido": u.get("apellido", ""),
+                "telefono": u.get("telefono", ""),
+                "nombreCompleto": f"{u.get('nombre','')} {u.get('apellido','')}".strip()
+            }
+        }).get_data())
+        return resp
     except Exception as e:
         return json_error(str(e), 401)
 
@@ -346,6 +204,8 @@ def auth_logout():
 @app.get("/auth/me")
 def auth_me():
     user = get_session_user()
+    if not user:
+        return jsonify({"ok": True, "user": None})
     return jsonify({"ok": True, "user": user})
 
 # =========================================================
@@ -356,9 +216,8 @@ def list_users():
     _, err = require_admin()
     if err:
         return err
-
     docs = db.collection("usuarios").stream()
-    users = [serialize_firestore_doc(d.to_dict()) for d in docs]
+    users = [d.to_dict() for d in docs]
     return jsonify({"ok": True, "users": users})
 
 # =========================================================
@@ -369,7 +228,6 @@ def orders_next_folio():
     _, err = require_auth()
     if err:
         return err
-
     folio, contador = next_folio()
     return jsonify({"ok": True, "Folio": folio, "Contador": contador})
 
@@ -387,12 +245,10 @@ def orders_list():
 
     docs = query.stream()
     orders = []
-
     for d in docs:
-        item = serialize_firestore_doc(d.to_dict())
+        item = d.to_dict()
         item["id"] = d.id
         orders.append(item)
-
     return jsonify({"ok": True, "orders": orders})
 
 @app.get("/orders/by-folio/<folio>")
@@ -403,18 +259,17 @@ def orders_by_folio(folio):
 
     docs = db.collection("pedidos").where("Folio", "==", folio).limit(1).stream()
     docs = list(docs)
-
     if not docs:
         return json_error("Pedido no encontrado", 404)
 
     d = docs[0]
-    order = serialize_firestore_doc(d.to_dict())
+    order = d.to_dict()
     order["id"] = d.id
     return jsonify({"ok": True, "order": order})
 
 @app.post("/orders")
 def orders_create():
-    _, err = require_auth()
+    user, err = require_auth()
     if err:
         return err
 
@@ -434,9 +289,9 @@ def orders_create():
     ref = db.collection("pedidos").document()
     ref.set(payload)
 
-    saved = serialize_firestore_doc(payload.copy())
+    saved = payload.copy()
     saved["id"] = ref.id
-
+    saved["FechaCreacion"] = None
     return jsonify({"ok": True, "order": saved})
 
 @app.patch("/orders/<order_id>")
@@ -448,7 +303,6 @@ def orders_update(order_id):
     data = request.get_json(silent=True) or {}
     data["actualizadoEn"] = firestore.SERVER_TIMESTAMP
     db.collection("pedidos").document(order_id).update(data)
-
     return jsonify({"ok": True})
 
 @app.delete("/orders/<order_id>")
@@ -472,7 +326,7 @@ def order_photos(order_id):
 
     photos = []
     for d in docs:
-        item = serialize_firestore_doc(d.to_dict())
+        item = d.to_dict()
         item["id"] = d.id
         photos.append(item)
 
@@ -488,7 +342,6 @@ def process_start():
         return err
 
     data = request.get_json(silent=True) or {}
-
     order_id = data.get("orderId")
     folio = data.get("folio")
     cantidad = int(data.get("cantidad", 0))
@@ -508,35 +361,18 @@ def process_start():
         "requestedAt": firestore.SERVER_TIMESTAMP,
         "lastHeartbeat": None
     })
-
     return jsonify({"ok": True})
 
 @app.get("/process/current")
 def process_current():
-    try:
-        doc = db.collection("control").document("proceso_actual").get()
-
-        if not doc.exists:
-            return jsonify({"ok": True, "process": None})
-
-        process_data = serialize_firestore_doc(doc.to_dict())
-
-        return jsonify({
-            "ok": True,
-            "process": process_data
-        })
-
-    except Exception as e:
-        print("ERROR /process/current:", repr(e))
-        return jsonify({
-            "ok": False,
-            "message": str(e)
-        }), 500
+    docs = db.collection("control").document("proceso_actual").get()
+    if not docs.exists:
+        return jsonify({"ok": True, "process": None})
+    return jsonify({"ok": True, "process": docs.to_dict()})
 
 @app.post("/process/report")
 def process_report():
     data = request.get_json(silent=True) or {}
-
     db.collection("control").document("proceso_actual").set({
         **data,
         "lastHeartbeat": firestore.SERVER_TIMESTAMP
@@ -603,7 +439,7 @@ def photos_upload():
     }
 
     db.collection("pedidos").document(order_id).collection("fotos").add(meta)
-    return jsonify({"ok": True, "photo": serialize_firestore_doc(meta)})
+    return jsonify({"ok": True, "photo": meta})
 
 # =========================================================
 # MAIN
