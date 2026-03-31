@@ -1,215 +1,460 @@
+# app.py
+# Backend Flask para:
+# Frontend -> Render -> Firebase Admin (Firestore)
+
 import os
-import io
 import json
-import base64
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from functools import wraps
+from datetime import datetime, timezone
 
-import requests
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-
 import firebase_admin
-from firebase_admin import credentials, auth, firestore, storage, initialize_app
+from firebase_admin import credentials, auth, firestore
 
-# =========================================================
-# CONFIGURACIÓN GENERAL
-# =========================================================
+# ══════════════════════════════════════════════
+# Step 1: Flask app
+# ══════════════════════════════════════════════
 app = Flask(__name__)
-# Importante: Ajusta 'origins' con la URL de tu frontend si es necesario
-CORS(app, supports_credentials=True)
 
-SESSION_COOKIE_NAME = "pe_session"
-SESSION_DAYS = 7
+ALLOWED_ORIGINS = os.getenv(
+    "CORS_ORIGINS",
+    "http://127.0.0.1:5500,http://localhost:5500,https://docker-planchaduria.onrender.com"
+).split(",")
 
-# Variables de entorno (Configúralas en el Dashboard de Render -> Environment)
-PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "db-planchaduria")
-STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "db-planchaduria.firebasestorage.app")
-ADMIN_UID = os.environ.get("ADMIN_UID", "HrGtBnzEtBXLK19YpeI8wTAaSM42")
-FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "").strip()
+CORS(
+    app,
+    resources={r"/api/*": {"origins": [o.strip() for o in ALLOWED_ORIGINS]}},
+    supports_credentials=True
+)
 
-# Ruta del Secret File en Render
-FIREBASE_CRED_FILE = "/etc/secrets/serviceAccountKey.json"
+ADMIN_UID = os.getenv("ADMIN_UID", "HrGtBnzEtBXLK19YpeI8wTAaSM42")
 
-db = None
-bucket = None
-
-# =========================================================
-# HELPERS Y SERIALIZACIÓN
-# =========================================================
-def mexico_now():
-    return datetime.now(ZoneInfo("America/Mexico_City"))
-
-def json_error(message, status=400):
-    return jsonify({"ok": False, "message": message}), status
-
-def serialize_firestore_value(value):
-    if value is None: return None
-    if isinstance(value, dict): return {k: serialize_firestore_value(v) for k, v in value.items()}
-    if isinstance(value, list): return [serialize_firestore_value(v) for v in value]
-    if hasattr(value, "isoformat"):
-        try: return value.isoformat()
-        except: pass
-    return value
-
-def serialize_firestore_doc(data):
-    if not data: return {}
-    return {k: serialize_firestore_value(v) for k, v in data.items()}
-
-# =========================================================
-# INICIALIZACIÓN DE FIREBASE
-# =========================================================
-def load_firebase_credential():
-    # 1. Prioridad: Secret File (Render)
-    if os.path.exists(FIREBASE_CRED_FILE):
-        print(f"✅ Cargando desde Secret File: {FIREBASE_CRED_FILE}")
-        return credentials.Certificate(FIREBASE_CRED_FILE)
-
-    # 2. Backup: Variable de Entorno JSON
-    json_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if json_env:
-        print("✅ Usando FIREBASE_SERVICE_ACCOUNT_JSON")
-        return credentials.Certificate(json.loads(json_env))
-
-    raise RuntimeError("No se encontró la llave de Firebase. Revisa /etc/secrets/ en Render.")
-
+# ══════════════════════════════════════════════
+# Step 2: Firebase Admin init
+# ══════════════════════════════════════════════
 def init_firebase():
-    global db, bucket
-    try:
-        cred = load_firebase_credential()
-        if not firebase_admin._apps:
-            initialize_app(cred, {"storageBucket": STORAGE_BUCKET})
-        
-        db = firestore.client()
-        bucket = storage.bucket()
-        print("🚀 Firebase y Storage conectados exitosamente")
-    except Exception as e:
-        print(f"❌ ERROR CRÍTICO EN FIREBASE: {e}")
+    if firebase_admin._apps:
+        return firestore.client()
 
-init_firebase()
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
-# =========================================================
-# LÓGICA DE SESIÓN
-# =========================================================
-def get_session_user():
-    session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
-    if not session_cookie: return None
-    try:
-        decoded = auth.verify_session_cookie(session_cookie, check_revoked=False)
-        uid = decoded["uid"]
-        user_doc = db.collection("usuarios").document(uid).get()
-        u_data = user_doc.to_dict() if user_doc.exists else {}
-        return {
-            "uid": uid,
-            "isAdmin": uid == ADMIN_UID,
-            "nombre": u_data.get("nombre", "Usuario"),
-            "email": u_data.get("email", "")
+    if service_account_json:
+        info = json.loads(service_account_json)
+    else:
+        private_key = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
+        info = {
+            "type": os.getenv("FIREBASE_TYPE", "service_account"),
+            "project_id": os.getenv("FIREBASE_PROJECT_ID"),
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
+            "private_key": private_key,
+            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
+            "auth_uri": os.getenv("FIREBASE_AUTH_URI", "https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": os.getenv("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": os.getenv(
+                "FIREBASE_AUTH_PROVIDER_CERT_URL",
+                "https://www.googleapis.com/oauth2/v1/certs"
+            ),
+            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
         }
-    except: return None
 
-def require_auth():
-    user = get_session_user()
-    if not user: return None, json_error("No autenticado", 401)
-    return user, None
+    missing = [
+        k for k, v in info.items()
+        if k in ["project_id", "private_key", "client_email"] and not v
+    ]
+    if missing:
+        raise RuntimeError(f"Faltan variables Firebase: {missing}")
 
-# =========================================================
-# RUTAS PRINCIPALES (ENDPOINTS)
-# =========================================================
+    cred = credentials.Certificate(info)
+    firebase_admin.initialize_app(cred)
+    return firestore.client()
 
-@app.route("/")
-def index():
-    """Ruta raíz para evitar el error 'Not Found'"""
+db = init_firebase()
+
+# ══════════════════════════════════════════════
+# Step 3: Helpers
+# ══════════════════════════════════════════════
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def doc_to_dict(doc):
+    data = doc.to_dict() or {}
+    data["id"] = doc.id
+    return serialize_data(data)
+
+def serialize_data(data):
+    if isinstance(data, dict):
+        return {k: serialize_data(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [serialize_data(v) for v in data]
+    if isinstance(data, datetime):
+        return data.isoformat()
+    return data
+
+def get_bearer_token():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    return auth_header.split("Bearer ", 1)[1].strip()
+
+def auth_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = get_bearer_token()
+        if not token:
+            return jsonify({"ok": False, "error": "Falta token de autorización"}), 401
+        try:
+            decoded = auth.verify_id_token(token)
+            request.user = decoded
+            return fn(*args, **kwargs)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Token inválido: {str(e)}"}), 401
+    return wrapper
+
+def admin_required(fn):
+    @wraps(fn)
+    @auth_required
+    def wrapper(*args, **kwargs):
+        uid = request.user.get("uid")
+        if uid != ADMIN_UID:
+            return jsonify({"ok": False, "error": "Acceso solo para administrador"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+def full_name(profile):
+    nombre = (profile.get("nombre") or "").strip()
+    apellido = (profile.get("apellido") or "").strip()
+    return f"{nombre} {apellido}".strip()
+
+def generate_folio_transaction():
+    meta_ref = db.collection("_meta").document("pedidos_counter")
+
+    @firestore.transactional
+    def update_in_transaction(transaction, ref):
+        snapshot = ref.get(transaction=transaction)
+        last_counter = 0
+        if snapshot.exists:
+            last_counter = int(snapshot.to_dict().get("ultimo_contador", 0))
+
+        new_counter = last_counter + 1
+        transaction.set(ref, {"ultimo_contador": new_counter}, merge=True)
+
+        folio = "#" + str(new_counter).zfill(5)
+        return folio, new_counter
+
+    transaction = db.transaction()
+    return update_in_transaction(transaction, meta_ref)
+
+# ══════════════════════════════════════════════
+# Step 4: Health
+# ══════════════════════════════════════════════
+@app.route("/", methods=["GET"])
+def home():
     return jsonify({
-        "ok": True, 
-        "message": "Backend de Planchado Express activo",
-        "status": "online"
+        "ok": True,
+        "message": "Backend Planchado Express activo",
+        "service": "Render + Flask + Firebase Admin"
     })
 
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
-    """Ruta de diagnóstico"""
-    return jsonify({
-        "ok": True, 
-        "db_connected": db is not None,
-        "bucket": STORAGE_BUCKET
-    })
+    return jsonify({"ok": True, "status": "healthy"})
 
-# --- CONTROL DE PROCESO (PC MAESTRO / UR3) ---
-@app.post("/process/start")
-def process_start():
-    user, err = require_auth()
-    if err: return err
-    
-    data = request.get_json(silent=True) or {}
-    order_id = data.get("orderId")
-    folio = data.get("folio")
-    cantidad = int(data.get("cantidad", 0))
+# ══════════════════════════════════════════════
+# Step 5: Perfil usuario
+# ══════════════════════════════════════════════
+@app.route("/api/me/profile", methods=["POST"])
+@auth_required
+def save_profile():
+    uid = request.user["uid"]
+    email_from_token = request.user.get("email", "")
 
-    if not order_id or not folio or cantidad < 1:
-        return json_error("Datos incompletos para iniciar rutina")
+    payload = request.get_json(silent=True) or {}
 
-    # Escribimos en la colección que la PC Maestro está monitoreando
-    db.collection("control").document("proceso_actual").set({
-        "active": True,
-        "status": "queued",
-        "orderId": order_id,
-        "folio": folio,
-        "cantidad": cantidad,
-        "requestedBy": user["uid"],
-        "requestedAt": firestore.SERVER_TIMESTAMP
-    })
-    
-    # También actualizamos el estado del pedido
-    db.collection("pedidos").document(order_id).update({"Estado": "en_proceso"})
-    
-    return jsonify({"ok": True, "message": "Orden enviada a la PC Maestro exitosamente"})
-
-# --- GESTIÓN DE FOTOS (PRENDAS REGISTRADAS) ---
-@app.get("/orders/<order_id>/photos")
-def get_order_photos(order_id):
-    _, err = require_auth()
-    if err: return err
-    
-    # Buscamos en la subcolección de fotos del pedido
-    docs = db.collection("pedidos").document(order_id).collection("fotos").order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
-    
-    photos = []
-    for d in docs:
-        p_data = serialize_firestore_doc(d.to_dict())
-        p_data["id"] = d.id
-        photos.append(p_data)
-        
-    return jsonify({"ok": True, "photos": photos})
-
-# --- CREACIÓN DE PEDIDOS ---
-@app.post("/orders")
-def orders_create():
-    user, err = require_auth()
-    if err: return err
-    
-    data = request.get_json(silent=True) or {}
-    
-    # Generación simple de Folio basado en conteo
-    snap = db.collection("pedidos").get()
-    nuevo_folio = f"#{str(len(snap) + 1).zfill(5)}"
-
-    payload = {
-        **data,
-        "Folio": nuevo_folio,
-        "clienteUid": user["uid"],
-        "Estado": "pendiente",
-        "FechaCreacion": firestore.SERVER_TIMESTAMP,
-        "Validado": False
+    data = {
+        "nombre": (payload.get("nombre") or "").strip(),
+        "apellido": (payload.get("apellido") or "").strip(),
+        "telefono": (payload.get("telefono") or "").strip(),
+        "email": (payload.get("email") or email_from_token).strip(),
+        "uid": uid,
+        "actualizadoEn": now_utc()
     }
-    
-    ref = db.collection("pedidos").document()
-    ref.set(payload)
-    
-    return jsonify({"ok": True, "orderId": ref.id, "folio": nuevo_folio})
 
-# =========================================================
-# EJECUCIÓN
-# =========================================================
+    ref = db.collection("usuarios").document(uid)
+    old = ref.get()
+
+    if not old.exists:
+        data["FechaCreacion"] = now_utc()
+
+    ref.set(data, merge=True)
+
+    saved = ref.get().to_dict() or {}
+    return jsonify({"ok": True, "profile": serialize_data(saved)})
+
+@app.route("/api/me/profile", methods=["GET"])
+@auth_required
+def get_profile():
+    uid = request.user["uid"]
+    ref = db.collection("usuarios").document(uid).get()
+
+    if not ref.exists:
+        return jsonify({
+            "ok": True,
+            "profile": {
+                "uid": uid,
+                "email": request.user.get("email", "")
+            }
+        })
+
+    return jsonify({"ok": True, "profile": serialize_data(ref.to_dict())})
+
+# ══════════════════════════════════════════════
+# Step 6: Cliente - crear pedido
+# ══════════════════════════════════════════════
+@app.route("/api/orders", methods=["POST"])
+@auth_required
+def create_order_from_client():
+    uid = request.user["uid"]
+    email = request.user.get("email", "")
+
+    payload = request.get_json(silent=True) or {}
+
+    tipo_prenda = (payload.get("tipoPrenda") or "").strip()
+    material = (payload.get("material") or "").strip()
+    cantidad = int(payload.get("cantidad") or 1)
+    fecha_entrega = (payload.get("FechaEntrega") or "").strip()
+    notas = (payload.get("notas") or "").strip()
+
+    if not tipo_prenda:
+        return jsonify({"ok": False, "error": "tipoPrenda es obligatorio"}), 400
+    if cantidad < 1:
+        return jsonify({"ok": False, "error": "cantidad debe ser al menos 1"}), 400
+    if not fecha_entrega:
+        return jsonify({"ok": False, "error": "FechaEntrega es obligatoria"}), 400
+
+    profile_doc = db.collection("usuarios").document(uid).get()
+    profile = profile_doc.to_dict() if profile_doc.exists else {}
+    cliente_name = full_name(profile) or request.user.get("name") or email
+
+    folio, contador = generate_folio_transaction()
+
+    data = {
+        "Folio": folio,
+        "Contador": contador,
+        "Estado": "pendiente",
+        "FolioIngresado": folio,
+        "Validado": False,
+        "cliente": cliente_name,
+        "clienteUid": uid,
+        "tipoPrenda": tipo_prenda,
+        "material": material,
+        "cantidad": cantidad,
+        "fechaIngreso": datetime.now().date().isoformat(),
+        "FechaEntrega": fecha_entrega,
+        "notas": notas,
+        "telefono": profile.get("telefono", ""),
+        "precio": None,
+        "origenCliente": True,
+        "FechaCreacion": now_utc(),
+        "actualizadoEn": now_utc()
+    }
+
+    doc_ref = db.collection("pedidos").document()
+    doc_ref.set(data)
+
+    saved = doc_ref.get()
+    return jsonify({"ok": True, "order": doc_to_dict(saved)}), 201
+
+# ══════════════════════════════════════════════
+# Step 7: Cliente - listar pedidos propios
+# ══════════════════════════════════════════════
+@app.route("/api/orders/mine", methods=["GET"])
+@auth_required
+def get_my_orders():
+    uid = request.user["uid"]
+
+    docs = (
+        db.collection("pedidos")
+        .where("clienteUid", "==", uid)
+        .stream()
+    )
+
+    items = [doc_to_dict(d) for d in docs]
+    items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
+
+    return jsonify({"ok": True, "orders": items})
+
+# ══════════════════════════════════════════════
+# Step 8: Tracking por folio
+# ══════════════════════════════════════════════
+@app.route("/api/orders/track/<folio>", methods=["GET"])
+def track_order(folio):
+    folio = folio.strip().upper()
+
+    docs = (
+        db.collection("pedidos")
+        .where("Folio", "==", folio)
+        .limit(1)
+        .stream()
+    )
+
+    docs = list(docs)
+    if not docs:
+        return jsonify({"ok": False, "error": f"No se encontró pedido con folio {folio}"}), 404
+
+    return jsonify({"ok": True, "order": doc_to_dict(docs[0])})
+
+# ══════════════════════════════════════════════
+# Step 9: Admin - listar pedidos
+# ══════════════════════════════════════════════
+@app.route("/api/admin/orders", methods=["GET"])
+@admin_required
+def admin_get_orders():
+    docs = db.collection("pedidos").stream()
+    items = [doc_to_dict(d) for d in docs]
+    items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
+    return jsonify({"ok": True, "orders": items})
+
+# ══════════════════════════════════════════════
+# Step 10: Admin - crear pedido
+# ══════════════════════════════════════════════
+@app.route("/api/admin/orders", methods=["POST"])
+@admin_required
+def admin_create_order():
+    payload = request.get_json(silent=True) or {}
+
+    cliente = (payload.get("cliente") or "").strip()
+    telefono = (payload.get("telefono") or "").strip()
+    tipo_prenda = (payload.get("tipoPrenda") or "").strip()
+    material = (payload.get("material") or "").strip()
+    cantidad = int(payload.get("cantidad") or 1)
+    precio = payload.get("precio")
+    fecha_ingreso = (payload.get("fechaIngreso") or "").strip()
+    fecha_entrega = (payload.get("FechaEntrega") or "").strip()
+    notas = (payload.get("notas") or "").strip()
+
+    if not cliente:
+        return jsonify({"ok": False, "error": "cliente es obligatorio"}), 400
+    if not tipo_prenda:
+        return jsonify({"ok": False, "error": "tipoPrenda es obligatorio"}), 400
+    if cantidad < 1:
+        return jsonify({"ok": False, "error": "cantidad debe ser al menos 1"}), 400
+    if not fecha_ingreso:
+        return jsonify({"ok": False, "error": "fechaIngreso es obligatoria"}), 400
+    if not fecha_entrega:
+        return jsonify({"ok": False, "error": "FechaEntrega es obligatoria"}), 400
+
+    folio, contador = generate_folio_transaction()
+
+    data = {
+        "Folio": folio,
+        "Contador": contador,
+        "Estado": "pendiente",
+        "FolioIngresado": folio,
+        "Validado": False,
+        "cliente": cliente,
+        "clienteUid": None,
+        "tipoPrenda": tipo_prenda,
+        "material": material,
+        "cantidad": cantidad,
+        "fechaIngreso": fecha_ingreso,
+        "FechaEntrega": fecha_entrega,
+        "notas": notas,
+        "telefono": telefono,
+        "precio": precio,
+        "origenCliente": False,
+        "FechaCreacion": now_utc(),
+        "actualizadoEn": now_utc()
+    }
+
+    doc_ref = db.collection("pedidos").document()
+    doc_ref.set(data)
+
+    return jsonify({"ok": True, "order": doc_to_dict(doc_ref.get())}), 201
+
+# ══════════════════════════════════════════════
+# Step 11: Admin - actualizar pedido
+# ══════════════════════════════════════════════
+@app.route("/api/admin/orders/<order_id>", methods=["PUT"])
+@admin_required
+def admin_update_order(order_id):
+    payload = request.get_json(silent=True) or {}
+    ref = db.collection("pedidos").document(order_id)
+    snap = ref.get()
+
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "Pedido no encontrado"}), 404
+
+    allowed_fields = {
+        "cliente", "telefono", "tipoPrenda", "material", "cantidad",
+        "precio", "fechaIngreso", "FechaEntrega", "notas", "Estado"
+    }
+
+    update_data = {}
+    for key, value in payload.items():
+        if key in allowed_fields:
+            update_data[key] = value
+
+    if "Estado" in update_data:
+        update_data["Validado"] = update_data["Estado"] == "entregado"
+
+    update_data["actualizadoEn"] = now_utc()
+
+    ref.update(update_data)
+    return jsonify({"ok": True, "order": doc_to_dict(ref.get())})
+
+# ══════════════════════════════════════════════
+# Step 12: Admin - eliminar pedido
+# ══════════════════════════════════════════════
+@app.route("/api/admin/orders/<order_id>", methods=["DELETE"])
+@admin_required
+def admin_delete_order(order_id):
+    ref = db.collection("pedidos").document(order_id)
+    snap = ref.get()
+
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "Pedido no encontrado"}), 404
+
+    ref.delete()
+    return jsonify({"ok": True, "message": "Pedido eliminado"})
+
+# ══════════════════════════════════════════════
+# Step 13: Admin - listar clientes
+# ══════════════════════════════════════════════
+@app.route("/api/admin/clients", methods=["GET"])
+@admin_required
+def admin_get_clients():
+    user_docs = list(db.collection("usuarios").stream())
+    order_docs = list(db.collection("pedidos").stream())
+
+    pedidos_por_uid = {}
+    for doc in order_docs:
+        data = doc.to_dict() or {}
+        uid = data.get("clienteUid")
+        if uid:
+            pedidos_por_uid[uid] = pedidos_por_uid.get(uid, 0) + 1
+
+    clients = []
+    for doc in user_docs:
+        data = doc.to_dict() or {}
+        nombre_completo = full_name(data) or data.get("email", "—")
+        clients.append({
+            "uid": doc.id,
+            "nombreCompleto": nombre_completo,
+            "nombre": data.get("nombre", ""),
+            "apellido": data.get("apellido", ""),
+            "email": data.get("email", ""),
+            "telefono": data.get("telefono", ""),
+            "pedidos": pedidos_por_uid.get(doc.id, 0)
+        })
+
+    clients.sort(key=lambda x: (x.get("nombreCompleto") or "").lower())
+    return jsonify({"ok": True, "clients": serialize_data(clients)})
+
+# ══════════════════════════════════════════════
+# Step 14: Main
+# ══════════════════════════════════════════════
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
