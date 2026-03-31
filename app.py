@@ -1,9 +1,5 @@
 # =========================================================
 # Planchado Express - Backend Render
-# Soporta Firebase key desde:
-# 1) FIREBASE_SERVICE_ACCOUNT_JSON
-# 2) FIREBASE_SERVICE_ACCOUNT_B64
-# 3) /etc/secrets/serviceAccountKey.json
 # =========================================================
 
 import os
@@ -50,6 +46,32 @@ def mexico_now():
 
 def json_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
+
+# =========================================================
+# SERIALIZACIÓN FIRESTORE
+# =========================================================
+def serialize_firestore_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        return {k: serialize_firestore_value(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [serialize_firestore_value(v) for v in value]
+
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+
+    return value
+
+def serialize_firestore_doc(data):
+    if not data:
+        return {}
+    return {k: serialize_firestore_value(v) for k, v in data.items()}
 
 # =========================================================
 # CARGA DE FIREBASE
@@ -110,7 +132,6 @@ def init_firebase():
 
     print("✅ Firebase inicializado correctamente")
 
-# Inicializar al arrancar
 try:
     init_firebase()
 except Exception as e:
@@ -337,7 +358,7 @@ def list_users():
         return err
 
     docs = db.collection("usuarios").stream()
-    users = [d.to_dict() for d in docs]
+    users = [serialize_firestore_doc(d.to_dict()) for d in docs]
     return jsonify({"ok": True, "users": users})
 
 # =========================================================
@@ -368,7 +389,7 @@ def orders_list():
     orders = []
 
     for d in docs:
-        item = d.to_dict()
+        item = serialize_firestore_doc(d.to_dict())
         item["id"] = d.id
         orders.append(item)
 
@@ -387,7 +408,7 @@ def orders_by_folio(folio):
         return json_error("Pedido no encontrado", 404)
 
     d = docs[0]
-    order = d.to_dict()
+    order = serialize_firestore_doc(d.to_dict())
     order["id"] = d.id
     return jsonify({"ok": True, "order": order})
 
@@ -413,9 +434,8 @@ def orders_create():
     ref = db.collection("pedidos").document()
     ref.set(payload)
 
-    saved = payload.copy()
+    saved = serialize_firestore_doc(payload.copy())
     saved["id"] = ref.id
-    saved["FechaCreacion"] = None
 
     return jsonify({"ok": True, "order": saved})
 
@@ -452,7 +472,7 @@ def order_photos(order_id):
 
     photos = []
     for d in docs:
-        item = d.to_dict()
+        item = serialize_firestore_doc(d.to_dict())
         item["id"] = d.id
         photos.append(item)
 
@@ -493,10 +513,25 @@ def process_start():
 
 @app.get("/process/current")
 def process_current():
-    doc = db.collection("control").document("proceso_actual").get()
-    if not doc.exists:
-        return jsonify({"ok": True, "process": None})
-    return jsonify({"ok": True, "process": doc.to_dict()})
+    try:
+        doc = db.collection("control").document("proceso_actual").get()
+
+        if not doc.exists:
+            return jsonify({"ok": True, "process": None})
+
+        process_data = serialize_firestore_doc(doc.to_dict())
+
+        return jsonify({
+            "ok": True,
+            "process": process_data
+        })
+
+    except Exception as e:
+        print("ERROR /process/current:", repr(e))
+        return jsonify({
+            "ok": False,
+            "message": str(e)
+        }), 500
 
 @app.post("/process/report")
 def process_report():
@@ -568,7 +603,7 @@ def photos_upload():
     }
 
     db.collection("pedidos").document(order_id).collection("fotos").add(meta)
-    return jsonify({"ok": True, "photo": meta})
+    return jsonify({"ok": True, "photo": serialize_firestore_doc(meta)})
 
 # =========================================================
 # MAIN
