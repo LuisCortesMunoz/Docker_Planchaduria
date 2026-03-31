@@ -1,7 +1,3 @@
-# app.py
-# Backend Flask para:
-# Frontend -> Render -> Firebase Admin (Firestore)
-
 import os
 import json
 from functools import wraps
@@ -12,27 +8,25 @@ from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, auth, firestore
 
-# ══════════════════════════════════════════════
-# Step 1: Flask app
-# ══════════════════════════════════════════════
+# Step 1: Crear app Flask
 app = Flask(__name__)
 
+# Step 2: Configurar CORS
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ORIGINS",
-    "http://127.0.0.1:5500,http://localhost:5500,https://docker-planchaduria.onrender.com"
+    "http://127.0.0.1:5500,http://localhost:5500"
 ).split(",")
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": [o.strip() for o in ALLOWED_ORIGINS]}},
+    resources={r"/api/*": {"origins": [origin.strip() for origin in ALLOWED_ORIGINS]}},
     supports_credentials=True
 )
 
+# Step 3: UID admin
 ADMIN_UID = os.getenv("ADMIN_UID", "HrGtBnzEtBXLK19YpeI8wTAaSM42")
 
-# ══════════════════════════════════════════════
-# Step 2: Firebase Admin init
-# ══════════════════════════════════════════════
+# Step 4: Inicializar Firebase Admin
 def init_firebase():
     if firebase_admin._apps:
         return firestore.client()
@@ -59,12 +53,8 @@ def init_firebase():
             "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
         }
 
-    missing = [
-        k for k, v in info.items()
-        if k in ["project_id", "private_key", "client_email"] and not v
-    ]
-    if missing:
-        raise RuntimeError(f"Faltan variables Firebase: {missing}")
+    if not info.get("project_id") or not info.get("private_key") or not info.get("client_email"):
+        raise RuntimeError("Faltan variables de entorno de Firebase.")
 
     cred = credentials.Certificate(info)
     firebase_admin.initialize_app(cred)
@@ -72,16 +62,9 @@ def init_firebase():
 
 db = init_firebase()
 
-# ══════════════════════════════════════════════
-# Step 3: Helpers
-# ══════════════════════════════════════════════
+# Step 5: Helpers generales
 def now_utc():
     return datetime.now(timezone.utc)
-
-def doc_to_dict(doc):
-    data = doc.to_dict() or {}
-    data["id"] = doc.id
-    return serialize_data(data)
 
 def serialize_data(data):
     if isinstance(data, dict):
@@ -91,6 +74,11 @@ def serialize_data(data):
     if isinstance(data, datetime):
         return data.isoformat()
     return data
+
+def doc_to_dict(doc):
+    data = doc.to_dict() or {}
+    data["id"] = doc.id
+    return serialize_data(data)
 
 def get_bearer_token():
     auth_header = request.headers.get("Authorization", "")
@@ -127,6 +115,7 @@ def full_name(profile):
     apellido = (profile.get("apellido") or "").strip()
     return f"{nombre} {apellido}".strip()
 
+# Step 6: Generar folio seguro con contador
 def generate_folio_transaction():
     meta_ref = db.collection("_meta").document("pedidos_counter")
 
@@ -134,6 +123,7 @@ def generate_folio_transaction():
     def update_in_transaction(transaction, ref):
         snapshot = ref.get(transaction=transaction)
         last_counter = 0
+
         if snapshot.exists:
             last_counter = int(snapshot.to_dict().get("ultimo_contador", 0))
 
@@ -146,24 +136,22 @@ def generate_folio_transaction():
     transaction = db.transaction()
     return update_in_transaction(transaction, meta_ref)
 
-# ══════════════════════════════════════════════
-# Step 4: Health
-# ══════════════════════════════════════════════
+# Step 7: Rutas base
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "ok": True,
-        "message": "Backend Planchado Express activo",
-        "service": "Render + Flask + Firebase Admin"
+        "message": "Backend Planchado Express activo"
     })
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "status": "healthy"})
+    return jsonify({
+        "ok": True,
+        "status": "healthy"
+    })
 
-# ══════════════════════════════════════════════
-# Step 5: Perfil usuario
-# ══════════════════════════════════════════════
+# Step 8: Perfil usuario
 @app.route("/api/me/profile", methods=["POST"])
 @auth_required
 def save_profile():
@@ -188,9 +176,12 @@ def save_profile():
         data["FechaCreacion"] = now_utc()
 
     ref.set(data, merge=True)
-
     saved = ref.get().to_dict() or {}
-    return jsonify({"ok": True, "profile": serialize_data(saved)})
+
+    return jsonify({
+        "ok": True,
+        "profile": serialize_data(saved)
+    })
 
 @app.route("/api/me/profile", methods=["GET"])
 @auth_required
@@ -207,11 +198,12 @@ def get_profile():
             }
         })
 
-    return jsonify({"ok": True, "profile": serialize_data(ref.to_dict())})
+    return jsonify({
+        "ok": True,
+        "profile": serialize_data(ref.to_dict())
+    })
 
-# ══════════════════════════════════════════════
-# Step 6: Cliente - crear pedido
-# ══════════════════════════════════════════════
+# Step 9: Cliente crea pedido
 @app.route("/api/orders", methods=["POST"])
 @auth_required
 def create_order_from_client():
@@ -263,62 +255,63 @@ def create_order_from_client():
     doc_ref = db.collection("pedidos").document()
     doc_ref.set(data)
 
-    saved = doc_ref.get()
-    return jsonify({"ok": True, "order": doc_to_dict(saved)}), 201
+    return jsonify({
+        "ok": True,
+        "order": doc_to_dict(doc_ref.get())
+    }), 201
 
-# ══════════════════════════════════════════════
-# Step 7: Cliente - listar pedidos propios
-# ══════════════════════════════════════════════
+# Step 10: Cliente ve sus pedidos
 @app.route("/api/orders/mine", methods=["GET"])
 @auth_required
 def get_my_orders():
     uid = request.user["uid"]
 
-    docs = (
-        db.collection("pedidos")
-        .where("clienteUid", "==", uid)
-        .stream()
-    )
-
-    items = [doc_to_dict(d) for d in docs]
+    docs = db.collection("pedidos").where("clienteUid", "==", uid).stream()
+    items = [doc_to_dict(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
 
-    return jsonify({"ok": True, "orders": items})
+    return jsonify({
+        "ok": True,
+        "orders": items
+    })
 
-# ══════════════════════════════════════════════
-# Step 8: Tracking por folio
-# ══════════════════════════════════════════════
+# Step 11: Tracking por folio
 @app.route("/api/orders/track/<folio>", methods=["GET"])
 def track_order(folio):
     folio = folio.strip().upper()
 
-    docs = (
+    docs = list(
         db.collection("pedidos")
         .where("Folio", "==", folio)
         .limit(1)
         .stream()
     )
 
-    docs = list(docs)
     if not docs:
-        return jsonify({"ok": False, "error": f"No se encontró pedido con folio {folio}"}), 404
+        return jsonify({
+            "ok": False,
+            "error": f"No se encontró pedido con folio {folio}"
+        }), 404
 
-    return jsonify({"ok": True, "order": doc_to_dict(docs[0])})
+    return jsonify({
+        "ok": True,
+        "order": doc_to_dict(docs[0])
+    })
 
-# ══════════════════════════════════════════════
-# Step 9: Admin - listar pedidos
-# ══════════════════════════════════════════════
+# Step 12: Admin ve todos los pedidos
 @app.route("/api/admin/orders", methods=["GET"])
 @admin_required
 def admin_get_orders():
     docs = db.collection("pedidos").stream()
-    items = [doc_to_dict(d) for d in docs]
+    items = [doc_to_dict(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
-    return jsonify({"ok": True, "orders": items})
 
-# ══════════════════════════════════════════════
-# Step 10: Admin - crear pedido
-# ══════════════════════════════════════════════
+    return jsonify({
+        "ok": True,
+        "orders": items
+    })
+
+# Step 13: Admin crea pedido
 @app.route("/api/admin/orders", methods=["POST"])
 @admin_required
 def admin_create_order():
@@ -337,7 +330,7 @@ def admin_create_order():
     if not cliente:
         return jsonify({"ok": False, "error": "cliente es obligatorio"}), 400
     if not tipo_prenda:
-        return jsonify({"ok": False, "error": "tipoPrenda es obligatorio"}), 400
+        return jsonify({"ok": False, "error": "tipoPrenda es obligatoria"}), 400
     if cantidad < 1:
         return jsonify({"ok": False, "error": "cantidad debe ser al menos 1"}), 400
     if not fecha_ingreso:
@@ -371,11 +364,12 @@ def admin_create_order():
     doc_ref = db.collection("pedidos").document()
     doc_ref.set(data)
 
-    return jsonify({"ok": True, "order": doc_to_dict(doc_ref.get())}), 201
+    return jsonify({
+        "ok": True,
+        "order": doc_to_dict(doc_ref.get())
+    }), 201
 
-# ══════════════════════════════════════════════
-# Step 11: Admin - actualizar pedido
-# ══════════════════════════════════════════════
+# Step 14: Admin actualiza pedido
 @app.route("/api/admin/orders/<order_id>", methods=["PUT"])
 @admin_required
 def admin_update_order(order_id):
@@ -402,11 +396,13 @@ def admin_update_order(order_id):
     update_data["actualizadoEn"] = now_utc()
 
     ref.update(update_data)
-    return jsonify({"ok": True, "order": doc_to_dict(ref.get())})
 
-# ══════════════════════════════════════════════
-# Step 12: Admin - eliminar pedido
-# ══════════════════════════════════════════════
+    return jsonify({
+        "ok": True,
+        "order": doc_to_dict(ref.get())
+    })
+
+# Step 15: Admin elimina pedido
 @app.route("/api/admin/orders/<order_id>", methods=["DELETE"])
 @admin_required
 def admin_delete_order(order_id):
@@ -417,11 +413,13 @@ def admin_delete_order(order_id):
         return jsonify({"ok": False, "error": "Pedido no encontrado"}), 404
 
     ref.delete()
-    return jsonify({"ok": True, "message": "Pedido eliminado"})
 
-# ══════════════════════════════════════════════
-# Step 13: Admin - listar clientes
-# ══════════════════════════════════════════════
+    return jsonify({
+        "ok": True,
+        "message": "Pedido eliminado"
+    })
+
+# Step 16: Admin ve clientes
 @app.route("/api/admin/clients", methods=["GET"])
 @admin_required
 def admin_get_clients():
@@ -430,10 +428,10 @@ def admin_get_clients():
 
     pedidos_por_uid = {}
     for doc in order_docs:
-        data = doc.to_dict() or {}
-        uid = data.get("clienteUid")
-        if uid:
-            pedidos_por_uid[uid] = pedidos_por_uid.get(uid, 0) + 1
+      data = doc.to_dict() or {}
+      uid = data.get("clienteUid")
+      if uid:
+          pedidos_por_uid[uid] = pedidos_por_uid.get(uid, 0) + 1
 
     clients = []
     for doc in user_docs:
@@ -450,11 +448,13 @@ def admin_get_clients():
         })
 
     clients.sort(key=lambda x: (x.get("nombreCompleto") or "").lower())
-    return jsonify({"ok": True, "clients": serialize_data(clients)})
 
-# ══════════════════════════════════════════════
-# Step 14: Main
-# ══════════════════════════════════════════════
+    return jsonify({
+        "ok": True,
+        "clients": serialize_data(clients)
+    })
+
+# Step 17: Ejecutar app
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
