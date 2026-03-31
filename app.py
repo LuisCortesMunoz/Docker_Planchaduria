@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 
 # =========================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # =========================================================
 app = Flask(__name__)
 CORS(app)
@@ -34,6 +34,7 @@ if not firebase_admin._apps:
 
 fs = firestore.client()
 
+# Realtime DB para rutina y fotos generales
 estado_ref = db.reference("estado_actual")
 historial_ref = db.reference("historial")
 fotos_ref = db.reference("fotos")
@@ -52,12 +53,16 @@ estado_memoria = {
 def now_mx():
     return datetime.now(ZoneInfo("America/Mexico_City"))
 
-def ok(data=None, message="OK", status=200):
-    return jsonify({
+
+def ok_json(payload=None, message="OK", status=200):
+    body = {
         "ok": True,
-        "message": message,
-        **({"data": data} if data is not None else {})
-    }), status
+        "message": message
+    }
+    if payload:
+        body.update(payload)
+    return jsonify(body), status
+
 
 def fail(message="Error", status=400):
     return jsonify({
@@ -65,50 +70,17 @@ def fail(message="Error", status=400):
         "message": message
     }), status
 
-def user_doc_to_json(doc):
-    data = doc.to_dict() or {}
-    return {
-        "uid": doc.id,
-        "nombre": data.get("nombre", ""),
-        "apellido": data.get("apellido", ""),
-        "nombreCompleto": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
-        "email": data.get("email", ""),
-        "telefono": data.get("telefono", ""),
-        "created_at": data.get("created_at", "")
-    }
-
-def order_doc_to_json(doc):
-    data = doc.to_dict() or {}
-    return {
-        "id": doc.id,
-        "Folio": data.get("Folio", ""),
-        "Contador": data.get("Contador", 0),
-        "cliente": data.get("cliente", ""),
-        "clienteUid": data.get("clienteUid", ""),
-        "telefono": data.get("telefono", ""),
-        "tipoPrenda": data.get("tipoPrenda", ""),
-        "material": data.get("material", ""),
-        "cantidad": data.get("cantidad", 1),
-        "precio": data.get("precio"),
-        "fechaIngreso": data.get("fechaIngreso", ""),
-        "FechaEntrega": data.get("FechaEntrega", ""),
-        "notas": data.get("notas", ""),
-        "Estado": data.get("Estado", "pendiente"),
-        "Validado": data.get("Validado", False),
-        "origenCliente": data.get("origenCliente", False),
-        "FolioIngresado": data.get("FolioIngresado", ""),
-        "created_at": data.get("created_at", ""),
-        "updated_at": data.get("updated_at", "")
-    }
 
 def is_admin_uid(uid):
     return bool(ADMIN_UID) and uid == ADMIN_UID
+
 
 def get_bearer_token():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
     return auth_header.split(" ", 1)[1].strip()
+
 
 def require_auth(admin=False):
     def decorator(fn):
@@ -134,6 +106,50 @@ def require_auth(admin=False):
         return wrapper
     return decorator
 
+
+def user_doc_to_json(doc):
+    data = doc.to_dict() or {}
+    return {
+        "uid": doc.id,
+        "nombre": data.get("nombre", ""),
+        "apellido": data.get("apellido", ""),
+        "nombreCompleto": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+        "email": data.get("email", ""),
+        "telefono": data.get("telefono", ""),
+        "created_at": data.get("created_at", "")
+    }
+
+
+def order_doc_to_json(doc):
+    data = doc.to_dict() or {}
+    return {
+        "id": doc.id,
+        "Folio": data.get("Folio", ""),
+        "Contador": data.get("Contador", 0),
+        "cliente": data.get("cliente", ""),
+        "clienteUid": data.get("clienteUid", ""),
+        "telefono": data.get("telefono", ""),
+        "tipoPrenda": data.get("tipoPrenda", ""),
+        "material": data.get("material", ""),
+        "cantidad": data.get("cantidad", 1),
+        "precio": data.get("precio"),
+        "fechaIngreso": data.get("fechaIngreso", ""),
+        "FechaEntrega": data.get("FechaEntrega", ""),
+        "notas": data.get("notas", ""),
+        "Estado": data.get("Estado", "pendiente"),
+        "Validado": data.get("Validado", False),
+        "origenCliente": data.get("origenCliente", False),
+        "FolioIngresado": data.get("FolioIngresado", ""),
+        "fotos": data.get("fotos", []),
+        "rutina_activa": data.get("rutina_activa", False),
+        "started_at": data.get("started_at", ""),
+        "completed_at": data.get("completed_at", ""),
+        "ultimo_error": data.get("ultimo_error", ""),
+        "created_at": data.get("created_at", ""),
+        "updated_at": data.get("updated_at", "")
+    }
+
+
 # =========================================================
 # FIREBASE AUTH REST
 # =========================================================
@@ -147,12 +163,14 @@ def firebase_sign_up(email, password):
         "password": password,
         "returnSecureToken": True
     }, timeout=30)
+
     data = resp.json()
 
     if resp.status_code != 200:
         raise RuntimeError(data.get("error", {}).get("message", "No se pudo registrar"))
 
     return data
+
 
 def firebase_sign_in(email, password):
     if not FIREBASE_WEB_API_KEY:
@@ -164,12 +182,14 @@ def firebase_sign_in(email, password):
         "password": password,
         "returnSecureToken": True
     }, timeout=30)
+
     data = resp.json()
 
     if resp.status_code != 200:
         raise RuntimeError(data.get("error", {}).get("message", "No se pudo iniciar sesión"))
 
     return data
+
 
 def auth_error_message(raw_message):
     mapping = {
@@ -182,6 +202,7 @@ def auth_error_message(raw_message):
         "INVALID_LOGIN_CREDENTIALS": "Credenciales incorrectas."
     }
     return mapping.get(raw_message, raw_message)
+
 
 # =========================================================
 # CONTADOR DE FOLIOS
@@ -200,14 +221,16 @@ def next_order_counter(transaction):
     transaction.set(counter_ref, {"value": new_value})
     return new_value
 
+
 def generate_folio():
     transaction = fs.transaction()
     contador = next_order_counter(transaction)
     folio = "#" + str(contador).zfill(5)
     return folio, contador
 
+
 # =========================================================
-# ESTADO MÁQUINA / FLUJO ANTERIOR
+# ESTADO MEMORIA PARA RUTINA ANTERIOR
 # =========================================================
 def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
     global estado_memoria
@@ -225,6 +248,7 @@ def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
         estado_memoria["estado"] = estado
 
     estado_memoria["updated_at"] = now_mx().isoformat()
+
     estado_ref.set(estado_memoria)
 
     historial_ref.push({
@@ -235,6 +259,7 @@ def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
         "timestamp": estado_memoria["updated_at"]
     })
 
+
 def cargar_estado():
     global estado_memoria
     try:
@@ -243,6 +268,7 @@ def cargar_estado():
             estado_memoria = data
     except Exception as e:
         print("Error al cargar estado:", e)
+
 
 cargar_estado()
 
@@ -255,6 +281,7 @@ def home():
         "ok": True,
         "message": "Backend Render activo"
     })
+
 
 # =========================================================
 # AUTH
@@ -308,9 +335,11 @@ def api_register():
     except Exception as e:
         return fail(auth_error_message(str(e)), 400)
 
+
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
+
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", "")).strip()
 
@@ -345,12 +374,12 @@ def api_login():
     except Exception as e:
         return fail(auth_error_message(str(e)), 400)
 
+
 @app.route("/api/auth/me", methods=["GET"])
 @require_auth(admin=False)
 def api_me():
     uid = request.user_uid
     doc = fs.collection("usuarios").document(uid).get()
-
     profile = doc.to_dict() if doc.exists else {}
 
     user = {
@@ -367,6 +396,7 @@ def api_me():
         "ok": True,
         "user": user
     }), 200
+
 
 # =========================================================
 # PEDIDOS CLIENTE
@@ -418,6 +448,11 @@ def api_create_order_client():
         "Validado": False,
         "origenCliente": True,
         "FolioIngresado": folio,
+        "fotos": [],
+        "rutina_activa": False,
+        "started_at": "",
+        "completed_at": "",
+        "ultimo_error": "",
         "created_at": now_mx().isoformat(),
         "updated_at": now_mx().isoformat()
     }
@@ -434,15 +469,13 @@ def api_create_order_client():
         }
     }), 201
 
+
 @app.route("/api/orders/my", methods=["GET"])
 @require_auth(admin=False)
 def api_orders_my():
     uid = request.user_uid
 
-    docs = fs.collection("pedidos") \
-        .where("clienteUid", "==", uid) \
-        .stream()
-
+    docs = fs.collection("pedidos").where("clienteUid", "==", uid).stream()
     items = [order_doc_to_json(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
 
@@ -451,12 +484,12 @@ def api_orders_my():
         "orders": items
     }), 200
 
+
 @app.route("/api/orders/track/<folio>", methods=["GET"])
 def api_orders_track(folio):
     folio = str(folio).strip().upper()
 
-    docs = fs.collection("pedidos").where("Folio", "==", folio).stream()
-    docs = list(docs)
+    docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
 
     if not docs:
         return fail(f"No se encontró ningún pedido con ID {folio}", 404)
@@ -465,6 +498,7 @@ def api_orders_track(folio):
         "ok": True,
         "order": order_doc_to_json(docs[0])
     }), 200
+
 
 # =========================================================
 # ADMIN PEDIDOS
@@ -480,6 +514,7 @@ def api_admin_orders_list():
         "ok": True,
         "orders": items
     }), 200
+
 
 @app.route("/api/admin/orders", methods=["POST"])
 @require_auth(admin=True)
@@ -527,6 +562,11 @@ def api_admin_orders_create():
         "Validado": False,
         "origenCliente": False,
         "FolioIngresado": folio,
+        "fotos": [],
+        "rutina_activa": False,
+        "started_at": "",
+        "completed_at": "",
+        "ultimo_error": "",
         "created_at": now_mx().isoformat(),
         "updated_at": now_mx().isoformat()
     }
@@ -543,6 +583,7 @@ def api_admin_orders_create():
         }
     }), 201
 
+
 @app.route("/api/admin/orders/<order_id>", methods=["PATCH"])
 @require_auth(admin=True)
 def api_admin_orders_update(order_id):
@@ -553,6 +594,7 @@ def api_admin_orders_update(order_id):
         return fail("Pedido no encontrado", 404)
 
     data = request.get_json(silent=True) or {}
+
     allowed_keys = {
         "cliente", "telefono", "tipoPrenda", "material", "cantidad",
         "precio", "fechaIngreso", "FechaEntrega", "notas", "Estado"
@@ -575,6 +617,7 @@ def api_admin_orders_update(order_id):
         "message": "Pedido actualizado correctamente"
     }), 200
 
+
 @app.route("/api/admin/orders/<order_id>", methods=["DELETE"])
 @require_auth(admin=True)
 def api_admin_orders_delete(order_id):
@@ -590,6 +633,7 @@ def api_admin_orders_delete(order_id):
         "ok": True,
         "message": "Pedido eliminado correctamente"
     }), 200
+
 
 @app.route("/api/admin/clients", methods=["GET"])
 @require_auth(admin=True)
@@ -617,8 +661,148 @@ def api_admin_clients():
         "clients": clients
     }), 200
 
+
 # =========================================================
-# FLUJO ANTERIOR / ESTADO DEL PROCESO
+# ENDPOINTS WORKER NUEVOS
+# =========================================================
+@app.route("/api/worker/next-order", methods=["GET"])
+def api_worker_next_order():
+    docs = fs.collection("pedidos").where("Estado", "==", "pendiente").stream()
+    items = [order_doc_to_json(doc) for doc in docs]
+    items.sort(key=lambda x: x.get("Contador", 0))
+
+    if not items:
+        return jsonify({
+            "ok": True,
+            "order": None
+        }), 200
+
+    return jsonify({
+        "ok": True,
+        "order": items[0]
+    }), 200
+
+
+@app.route("/api/worker/orders/<order_id>/start", methods=["POST"])
+def api_worker_order_start(order_id):
+    doc_ref = fs.collection("pedidos").document(order_id)
+    snap = doc_ref.get()
+
+    if not snap.exists:
+        return fail("Pedido no encontrado", 404)
+
+    doc_ref.update({
+        "Estado": "en_proceso",
+        "rutina_activa": True,
+        "started_at": now_mx().isoformat(),
+        "updated_at": now_mx().isoformat()
+    })
+
+    return jsonify({
+        "ok": True,
+        "message": "Pedido iniciado"
+    }), 200
+
+
+@app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
+def api_worker_order_photo(order_id):
+    doc_ref = fs.collection("pedidos").document(order_id)
+    snap = doc_ref.get()
+
+    if not snap.exists:
+        return fail("Pedido no encontrado", 404)
+
+    if "foto" not in request.files:
+        return fail("No se recibió archivo", 400)
+
+    archivo = request.files["foto"]
+
+    if archivo.filename == "":
+        return fail("Archivo vacío", 400)
+
+    now = now_mx()
+    fecha = now.strftime("%Y-%m-%d")
+    hora = now.strftime("%H:%M:%S")
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+
+    nombre_seguro = secure_filename(archivo.filename)
+    nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
+    ruta = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+
+    archivo.save(ruta)
+
+    foto_info = {
+        "nombre": nombre_final,
+        "url": f"/fotos/{nombre_final}",
+        "fecha": fecha,
+        "hora": hora,
+        "fecha_hora": f"{fecha} {hora}",
+        "timestamp": now.isoformat()
+    }
+
+    data = snap.to_dict() or {}
+    fotos = data.get("fotos", [])
+    fotos.append(foto_info)
+
+    doc_ref.update({
+        "fotos": fotos,
+        "updated_at": now.isoformat()
+    })
+
+    return jsonify({
+        "ok": True,
+        "message": "Foto agregada al pedido",
+        "foto": foto_info
+    }), 200
+
+
+@app.route("/api/worker/orders/<order_id>/complete", methods=["POST"])
+def api_worker_order_complete(order_id):
+    doc_ref = fs.collection("pedidos").document(order_id)
+    snap = doc_ref.get()
+
+    if not snap.exists:
+        return fail("Pedido no encontrado", 404)
+
+    doc_ref.update({
+        "Estado": "listo",
+        "rutina_activa": False,
+        "completed_at": now_mx().isoformat(),
+        "updated_at": now_mx().isoformat()
+    })
+
+    return jsonify({
+        "ok": True,
+        "message": "Pedido completado"
+    }), 200
+
+
+@app.route("/api/worker/orders/<order_id>/error", methods=["POST"])
+def api_worker_order_error(order_id):
+    doc_ref = fs.collection("pedidos").document(order_id)
+    snap = doc_ref.get()
+
+    if not snap.exists:
+        return fail("Pedido no encontrado", 404)
+
+    data = request.get_json(silent=True) or {}
+    error_msg = str(data.get("error", "Error no especificado"))
+
+    doc_ref.update({
+        "Estado": "pendiente",
+        "rutina_activa": False,
+        "ultimo_error": error_msg,
+        "updated_at": now_mx().isoformat()
+    })
+
+    return jsonify({
+        "ok": True,
+        "message": "Error registrado"
+    }), 200
+
+
+# =========================================================
+# ENDPOINTS ANTIGUOS DE RUTINA
 # =========================================================
 @app.route("/estado", methods=["GET"])
 def obtener_estado():
@@ -627,10 +811,10 @@ def obtener_estado():
         "data": estado_memoria
     })
 
+
 @app.route("/set_usuario", methods=["POST"])
 def set_usuario():
     data = request.get_json(silent=True) or {}
-
     usuario = str(data.get("usuario", "")).strip()
 
     if not usuario or not usuario.isdigit() or len(usuario) > 5:
@@ -643,6 +827,7 @@ def set_usuario():
         "message": f"Usuario {usuario} guardado correctamente",
         "data": estado_memoria
     }), 200
+
 
 @app.route("/set_cantidad", methods=["POST"])
 def set_cantidad():
@@ -670,6 +855,7 @@ def set_cantidad():
         "data": estado_memoria
     }), 200
 
+
 @app.route("/activar_plc", methods=["POST"])
 def activar_plc():
     data = request.get_json(silent=True) or {}
@@ -690,6 +876,7 @@ def activar_plc():
         "data": estado_memoria
     }), 200
 
+
 @app.route("/desactivar_plc", methods=["POST"])
 def desactivar_plc():
     guardar_estado(
@@ -702,6 +889,7 @@ def desactivar_plc():
         "message": "PLC desactivado correctamente",
         "data": estado_memoria
     }), 200
+
 
 @app.route("/subir_foto", methods=["POST"])
 def subir_foto():
@@ -747,6 +935,7 @@ def subir_foto():
         "foto": foto_info
     }), 200
 
+
 @app.route("/fotos_usuario/<usuario>", methods=["GET"])
 def fotos_usuario(usuario):
     usuario = str(usuario).strip()
@@ -778,9 +967,11 @@ def fotos_usuario(usuario):
         "fotos": lista
     }), 200
 
+
 @app.route("/fotos/<nombre_archivo>", methods=["GET"])
 def ver_foto(nombre_archivo):
     return send_from_directory(app.config["UPLOAD_FOLDER"], nombre_archivo)
+
 
 @app.route("/historial", methods=["GET"])
 def historial():
@@ -789,6 +980,7 @@ def historial():
         "ok": True,
         "data": data if data else {}
     }), 200
+
 
 # =========================================================
 # MAIN
