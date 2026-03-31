@@ -31,31 +31,59 @@ def init_firebase():
     if firebase_admin._apps:
         return firestore.client()
 
-    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    # Intentar primero con Secret File
+    possible_paths = [
+        "/etc/secrets/serviceAccountKey.json",
+        "serviceAccountKey.json"
+    ]
 
+    secret_file_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            secret_file_path = path
+            break
+
+    if secret_file_path:
+        print(f"✅ Usando Firebase key desde archivo secreto: {secret_file_path}")
+        cred = credentials.Certificate(secret_file_path)
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+
+    # Intentar con JSON completo en variable de entorno
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
     if service_account_json:
+        print("✅ Usando Firebase key desde FIREBASE_SERVICE_ACCOUNT_JSON")
         info = json.loads(service_account_json)
-    else:
-        private_key = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
-        info = {
-            "type": os.getenv("FIREBASE_TYPE", "service_account"),
-            "project_id": os.getenv("FIREBASE_PROJECT_ID"),
-            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-            "private_key": private_key,
-            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-            "auth_uri": os.getenv("FIREBASE_AUTH_URI", "https://accounts.google.com/o/oauth2/auth"),
-            "token_uri": os.getenv("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
-            "auth_provider_x509_cert_url": os.getenv(
-                "FIREBASE_AUTH_PROVIDER_CERT_URL",
-                "https://www.googleapis.com/oauth2/v1/certs"
-            ),
-            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
-        }
+        cred = credentials.Certificate(info)
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+
+    # Intentar con variables separadas
+    private_key = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
+    info = {
+        "type": os.getenv("FIREBASE_TYPE", "service_account"),
+        "project_id": os.getenv("FIREBASE_PROJECT_ID"),
+        "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
+        "private_key": private_key,
+        "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+        "client_id": os.getenv("FIREBASE_CLIENT_ID"),
+        "auth_uri": os.getenv("FIREBASE_AUTH_URI", "https://accounts.google.com/o/oauth2/auth"),
+        "token_uri": os.getenv("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
+        "auth_provider_x509_cert_url": os.getenv(
+            "FIREBASE_AUTH_PROVIDER_CERT_URL",
+            "https://www.googleapis.com/oauth2/v1/certs"
+        ),
+        "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
+    }
 
     if not info.get("project_id") or not info.get("private_key") or not info.get("client_email"):
-        raise RuntimeError("Faltan variables de entorno de Firebase.")
+        raise RuntimeError(
+            "No se encontró la credencial de Firebase. "
+            "Agrega el Secret File serviceAccountKey.json "
+            "o configura FIREBASE_SERVICE_ACCOUNT_JSON."
+        )
 
+    print("✅ Usando Firebase key desde variables separadas")
     cred = credentials.Certificate(info)
     firebase_admin.initialize_app(cred)
     return firestore.client()
@@ -428,10 +456,10 @@ def admin_get_clients():
 
     pedidos_por_uid = {}
     for doc in order_docs:
-      data = doc.to_dict() or {}
-      uid = data.get("clienteUid")
-      if uid:
-          pedidos_por_uid[uid] = pedidos_por_uid.get(uid, 0) + 1
+        data = doc.to_dict() or {}
+        uid = data.get("clienteUid")
+        if uid:
+            pedidos_por_uid[uid] = pedidos_por_uid.get(uid, 0) + 1
 
     clients = []
     for doc in user_docs:
