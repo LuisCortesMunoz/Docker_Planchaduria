@@ -703,7 +703,66 @@ def api_worker_order_start(order_id):
         "message": "Pedido iniciado"
     }), 200
 
+# =========================================================
+# ENDPOINTS WORKER NUEVOS
+# =========================================================
+@app.route("/api/worker/orders/<order_id>/status", methods=["POST"])
+def api_worker_order_status(order_id):
+    doc_ref = fs.collection("pedidos").document(order_id)
+    snap = doc_ref.get()
 
+    if not snap.exists:
+        return fail("Pedido no encontrado", 404)
+
+    data = request.get_json(silent=True) or {}
+    estado = str(data.get("Estado", data.get("estado", ""))).strip()
+
+    estados_validos = {
+        "pendiente",
+        "en_proceso",
+        "planchado",
+        "listo",
+        "entregado"
+    }
+
+    if not estado:
+        return fail("Debes enviar el estado", 400)
+
+    if estado not in estados_validos:
+        return fail("Estado inválido", 400)
+
+    payload = {
+        "Estado": estado,
+        "updated_at": now_mx().isoformat()
+    }
+
+    # Mantener coherencia con tu lógica actual
+    if estado == "en_proceso":
+        payload["rutina_activa"] = True
+        payload["started_at"] = now_mx().isoformat()
+
+    if estado == "planchado":
+        payload["rutina_activa"] = True
+
+    if estado == "listo":
+        payload["rutina_activa"] = False
+        payload["completed_at"] = now_mx().isoformat()
+
+    if estado == "entregado":
+        payload["rutina_activa"] = False
+        payload["Validado"] = True
+
+    if estado in {"pendiente", "en_proceso", "planchado", "listo"}:
+        payload["Validado"] = False
+
+    doc_ref.update(payload)
+
+    return jsonify({
+        "ok": True,
+        "message": f"Estado actualizado a {estado}",
+        "order_id": order_id,
+        "Estado": estado
+    }), 200
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
