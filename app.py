@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import firebase_admin
-from firebase_admin import credentials, firestore, db, auth as firebase_auth
+from firebase_admin import credentials, firestore, db, auth as firebase_auth, storage
 import os
 import requests
 from datetime import datetime
@@ -25,11 +25,13 @@ FIREBASE_CRED_FILE = os.environ.get("FIREBASE_CRED_FILE", "/etc/secrets/serviceA
 FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://db-planchaduria-default-rtdb.firebaseio.com")
 FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
+FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
     firebase_admin.initialize_app(cred, {
-        "databaseURL": FIREBASE_DB_URL
+        "databaseURL": FIREBASE_DB_URL,
+        "storageBucket": FIREBASE_STORAGE_BUCKET
     })
 
 fs = firestore.client()
@@ -79,7 +81,7 @@ def get_bearer_token():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
-    return auth_header.split(" ", 1)[1].strip()
+    return auth_header.split("Bearer ", 1)[1].strip()
 
 
 def require_auth(admin=False):
@@ -147,6 +149,22 @@ def order_doc_to_json(doc):
         "ultimo_error": data.get("ultimo_error", ""),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", "")
+    }
+
+
+def subir_archivo_a_firebase_storage(local_path, remote_path, content_type="image/jpeg"):
+    if not FIREBASE_STORAGE_BUCKET:
+        raise RuntimeError("Falta FIREBASE_STORAGE_BUCKET en Environment")
+
+    bucket = storage.bucket()
+    blob = bucket.blob(remote_path)
+
+    blob.upload_from_filename(local_path, content_type=content_type)
+    blob.make_public()
+
+    return {
+        "storage_path": remote_path,
+        "public_url": blob.public_url
     }
 
 
@@ -703,9 +721,7 @@ def api_worker_order_start(order_id):
         "message": "Pedido iniciado"
     }), 200
 
-# =========================================================
-# ENDPOINTS WORKER NUEVOS
-# =========================================================
+
 @app.route("/api/worker/orders/<order_id>/status", methods=["POST"])
 def api_worker_order_status(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
@@ -736,7 +752,6 @@ def api_worker_order_status(order_id):
         "updated_at": now_mx().isoformat()
     }
 
-    # Mantener coherencia con tu lógica actual
     if estado == "en_proceso":
         payload["rutina_activa"] = True
         payload["started_at"] = now_mx().isoformat()
@@ -763,6 +778,8 @@ def api_worker_order_status(order_id):
         "order_id": order_id,
         "Estado": estado
     }), 200
+
+
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
@@ -786,13 +803,22 @@ def api_worker_order_photo(order_id):
 
     nombre_seguro = secure_filename(archivo.filename)
     nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
-    ruta = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+    ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-    archivo.save(ruta)
+    archivo.save(ruta_local)
+
+    remote_path = f"pedidos/{order_id}/{nombre_final}"
+    storage_info = subir_archivo_a_firebase_storage(
+        local_path=ruta_local,
+        remote_path=remote_path,
+        content_type=archivo.mimetype or "image/jpeg"
+    )
 
     foto_info = {
         "nombre": nombre_final,
-        "url": f"/fotos/{nombre_final}",
+        "url": storage_info["public_url"],
+        "storage_path": storage_info["storage_path"],
+        "url_local": f"/fotos/{nombre_final}",
         "fecha": fecha,
         "hora": hora,
         "fecha_hora": f"{fecha} {hora}",
@@ -972,14 +998,23 @@ def subir_foto():
 
     nombre_seguro = secure_filename(archivo.filename)
     nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
-    ruta = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+    ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-    archivo.save(ruta)
+    archivo.save(ruta_local)
+
+    remote_path = f"usuarios/{usuario}/{nombre_final}"
+    storage_info = subir_archivo_a_firebase_storage(
+        local_path=ruta_local,
+        remote_path=remote_path,
+        content_type=archivo.mimetype or "image/jpeg"
+    )
 
     foto_info = {
         "usuario": usuario,
         "nombre": nombre_final,
-        "ruta": f"/fotos/{nombre_final}",
+        "ruta": storage_info["public_url"],
+        "storage_path": storage_info["storage_path"],
+        "ruta_local": f"/fotos/{nombre_final}",
         "fecha": fecha,
         "hora": hora,
         "etiqueta": f"{usuario}_{fecha}_{hora}",
