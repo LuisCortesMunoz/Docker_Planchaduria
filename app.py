@@ -81,7 +81,7 @@ def get_bearer_token():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
-    return auth_header.split("Bearer ", 1)[1].strip()
+    return auth_header.split(" ", 1)[1].strip()
 
 
 def require_auth(admin=False):
@@ -153,19 +153,40 @@ def order_doc_to_json(doc):
 
 
 def subir_archivo_a_firebase_storage(local_path, remote_path, content_type="image/jpeg"):
+    print("[STORAGE] Iniciando subida a Firebase Storage...")
+    print("[STORAGE] local_path:", local_path)
+    print("[STORAGE] remote_path:", remote_path)
+    print("[STORAGE] content_type:", content_type)
+    print("[STORAGE] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
+
     if not FIREBASE_STORAGE_BUCKET:
         raise RuntimeError("Falta FIREBASE_STORAGE_BUCKET en Environment")
 
-    bucket = storage.bucket()
-    blob = bucket.blob(remote_path)
+    if not os.path.exists(local_path):
+        raise RuntimeError(f"No existe el archivo local a subir: {local_path}")
 
-    blob.upload_from_filename(local_path, content_type=content_type)
-    blob.make_public()
+    try:
+        bucket = storage.bucket()
+        print("[STORAGE] bucket.name:", bucket.name)
 
-    return {
-        "storage_path": remote_path,
-        "public_url": blob.public_url
-    }
+        if not bucket.name:
+            raise RuntimeError("El bucket de Firebase Storage no está configurado correctamente")
+
+        blob = bucket.blob(remote_path)
+        blob.upload_from_filename(local_path, content_type=content_type)
+        blob.make_public()
+
+        print("[STORAGE] Archivo subido correctamente")
+        print("[STORAGE] URL pública:", blob.public_url)
+
+        return {
+            "storage_path": remote_path,
+            "public_url": blob.public_url
+        }
+
+    except Exception as e:
+        print("[STORAGE] Error al subir archivo:", type(e).__name__, str(e))
+        raise
 
 
 # =========================================================
@@ -782,63 +803,82 @@ def api_worker_order_status(order_id):
 
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
-    doc_ref = fs.collection("pedidos").document(order_id)
-    snap = doc_ref.get()
+    try:
+        print(f"[PHOTO] Iniciando carga de foto para pedido: {order_id}")
 
-    if not snap.exists:
-        return fail("Pedido no encontrado", 404)
+        doc_ref = fs.collection("pedidos").document(order_id)
+        snap = doc_ref.get()
 
-    if "foto" not in request.files:
-        return fail("No se recibió archivo", 400)
+        if not snap.exists:
+            return fail("Pedido no encontrado", 404)
 
-    archivo = request.files["foto"]
+        if "foto" not in request.files:
+            return fail("No se recibió archivo", 400)
 
-    if archivo.filename == "":
-        return fail("Archivo vacío", 400)
+        archivo = request.files["foto"]
 
-    now = now_mx()
-    fecha = now.strftime("%Y-%m-%d")
-    hora = now.strftime("%H:%M:%S")
-    stamp = now.strftime("%Y%m%d_%H%M%S")
+        if archivo.filename == "":
+            return fail("Archivo vacío", 400)
 
-    nombre_seguro = secure_filename(archivo.filename)
-    nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
-    ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+        now = now_mx()
+        fecha = now.strftime("%Y-%m-%d")
+        hora = now.strftime("%H:%M:%S")
+        stamp = now.strftime("%Y%m%d_%H%M%S")
 
-    archivo.save(ruta_local)
+        nombre_seguro = secure_filename(archivo.filename)
+        nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
+        ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-    remote_path = f"pedidos/{order_id}/{nombre_final}"
-    storage_info = subir_archivo_a_firebase_storage(
-        local_path=ruta_local,
-        remote_path=remote_path,
-        content_type=archivo.mimetype or "image/jpeg"
-    )
+        print("[PHOTO] Guardando archivo temporal en:", ruta_local)
+        archivo.save(ruta_local)
 
-    foto_info = {
-        "nombre": nombre_final,
-        "url": storage_info["public_url"],
-        "storage_path": storage_info["storage_path"],
-        "url_local": f"/fotos/{nombre_final}",
-        "fecha": fecha,
-        "hora": hora,
-        "fecha_hora": f"{fecha} {hora}",
-        "timestamp": now.isoformat()
-    }
+        if not os.path.exists(ruta_local):
+            raise RuntimeError("No se pudo guardar el archivo temporalmente")
 
-    data = snap.to_dict() or {}
-    fotos = data.get("fotos", [])
-    fotos.append(foto_info)
+        tam = os.path.getsize(ruta_local)
+        print("[PHOTO] Tamaño archivo local:", tam)
 
-    doc_ref.update({
-        "fotos": fotos,
-        "updated_at": now.isoformat()
-    })
+        if tam == 0:
+            raise RuntimeError("El archivo guardado quedó vacío")
 
-    return jsonify({
-        "ok": True,
-        "message": "Foto agregada al pedido",
-        "foto": foto_info
-    }), 200
+        remote_path = f"pedidos/{order_id}/{nombre_final}"
+        storage_info = subir_archivo_a_firebase_storage(
+            local_path=ruta_local,
+            remote_path=remote_path,
+            content_type=archivo.mimetype or "image/jpeg"
+        )
+
+        foto_info = {
+            "nombre": nombre_final,
+            "url": storage_info["public_url"],
+            "storage_path": storage_info["storage_path"],
+            "url_local": f"/fotos/{nombre_final}",
+            "fecha": fecha,
+            "hora": hora,
+            "fecha_hora": f"{fecha} {hora}",
+            "timestamp": now.isoformat()
+        }
+
+        data = snap.to_dict() or {}
+        fotos = data.get("fotos", [])
+        fotos.append(foto_info)
+
+        doc_ref.update({
+            "fotos": fotos,
+            "updated_at": now.isoformat()
+        })
+
+        print("[PHOTO] Foto guardada correctamente en pedido:", order_id)
+
+        return jsonify({
+            "ok": True,
+            "message": "Foto agregada al pedido",
+            "foto": foto_info
+        }), 200
+
+    except Exception as e:
+        print("[PHOTO] Error en /api/worker/orders/<order_id>/photo:", type(e).__name__, str(e))
+        return fail(f"Error interno al guardar la foto: {type(e).__name__}: {e}", 500)
 
 
 @app.route("/api/worker/orders/<order_id>/complete", methods=["POST"])
@@ -978,56 +1018,73 @@ def desactivar_plc():
 
 @app.route("/subir_foto", methods=["POST"])
 def subir_foto():
-    if "foto" not in request.files:
-        return fail("No se recibió archivo", 400)
+    try:
+        if "foto" not in request.files:
+            return fail("No se recibió archivo", 400)
 
-    usuario = str(request.form.get("usuario", "")).strip()
+        usuario = str(request.form.get("usuario", "")).strip()
 
-    if not usuario.isdigit() or len(usuario) > 5:
-        return fail("Usuario inválido", 400)
+        if not usuario.isdigit() or len(usuario) > 5:
+            return fail("Usuario inválido", 400)
 
-    archivo = request.files["foto"]
+        archivo = request.files["foto"]
 
-    if archivo.filename == "":
-        return fail("Archivo vacío", 400)
+        if archivo.filename == "":
+            return fail("Archivo vacío", 400)
 
-    now = now_mx()
-    fecha = now.strftime("%Y-%m-%d")
-    hora = now.strftime("%H:%M:%S")
-    stamp = now.strftime("%Y%m%d_%H%M%S")
+        now = now_mx()
+        fecha = now.strftime("%Y-%m-%d")
+        hora = now.strftime("%H:%M:%S")
+        stamp = now.strftime("%Y%m%d_%H%M%S")
 
-    nombre_seguro = secure_filename(archivo.filename)
-    nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
-    ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+        nombre_seguro = secure_filename(archivo.filename)
+        nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
+        ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-    archivo.save(ruta_local)
+        print("[SUBIR_FOTO] Guardando archivo temporal en:", ruta_local)
+        archivo.save(ruta_local)
 
-    remote_path = f"usuarios/{usuario}/{nombre_final}"
-    storage_info = subir_archivo_a_firebase_storage(
-        local_path=ruta_local,
-        remote_path=remote_path,
-        content_type=archivo.mimetype or "image/jpeg"
-    )
+        if not os.path.exists(ruta_local):
+            raise RuntimeError("No se pudo guardar el archivo temporalmente")
 
-    foto_info = {
-        "usuario": usuario,
-        "nombre": nombre_final,
-        "ruta": storage_info["public_url"],
-        "storage_path": storage_info["storage_path"],
-        "ruta_local": f"/fotos/{nombre_final}",
-        "fecha": fecha,
-        "hora": hora,
-        "etiqueta": f"{usuario}_{fecha}_{hora}",
-        "timestamp": now.isoformat()
-    }
+        tam = os.path.getsize(ruta_local)
+        print("[SUBIR_FOTO] Tamaño archivo local:", tam)
 
-    fotos_ref.push(foto_info)
+        if tam == 0:
+            raise RuntimeError("El archivo guardado quedó vacío")
 
-    return jsonify({
-        "ok": True,
-        "message": "Foto subida correctamente",
-        "foto": foto_info
-    }), 200
+        remote_path = f"usuarios/{usuario}/{nombre_final}"
+        storage_info = subir_archivo_a_firebase_storage(
+            local_path=ruta_local,
+            remote_path=remote_path,
+            content_type=archivo.mimetype or "image/jpeg"
+        )
+
+        foto_info = {
+            "usuario": usuario,
+            "nombre": nombre_final,
+            "ruta": storage_info["public_url"],
+            "storage_path": storage_info["storage_path"],
+            "ruta_local": f"/fotos/{nombre_final}",
+            "fecha": fecha,
+            "hora": hora,
+            "etiqueta": f"{usuario}_{fecha}_{hora}",
+            "timestamp": now.isoformat()
+        }
+
+        fotos_ref.push(foto_info)
+
+        print("[SUBIR_FOTO] Foto guardada correctamente para usuario:", usuario)
+
+        return jsonify({
+            "ok": True,
+            "message": "Foto subida correctamente",
+            "foto": foto_info
+        }), 200
+
+    except Exception as e:
+        print("[SUBIR_FOTO] Error:", type(e).__name__, str(e))
+        return fail(f"Error interno al subir la foto: {type(e).__name__}: {e}", 500)
 
 
 @app.route("/fotos_usuario/<usuario>", methods=["GET"])
