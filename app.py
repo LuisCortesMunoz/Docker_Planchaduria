@@ -2,9 +2,10 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import firebase_admin
-from firebase_admin import credentials, firestore, db, auth as firebase_auth, storage
+from firebase_admin import credentials, firestore, db, auth as firebase_auth
 import os
 import requests
+import base64
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from functools import wraps
@@ -25,17 +26,14 @@ FIREBASE_CRED_FILE = os.environ.get("FIREBASE_CRED_FILE", "/etc/secrets/serviceA
 FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://db-planchaduria-default-rtdb.firebaseio.com")
 FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
-FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
 
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
-print("[CONFIG] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
     firebase_admin.initialize_app(cred, {
-        "databaseURL": FIREBASE_DB_URL,
-        "storageBucket": FIREBASE_STORAGE_BUCKET
+        "databaseURL": FIREBASE_DB_URL
     })
 
 fs = firestore.client()
@@ -156,41 +154,18 @@ def order_doc_to_json(doc):
     }
 
 
-def subir_archivo_a_firebase_storage(local_path, remote_path, content_type="image/jpeg"):
-    print("[STORAGE] Iniciando subida a Firebase Storage...")
-    print("[STORAGE] local_path:", local_path)
-    print("[STORAGE] remote_path:", remote_path)
-    print("[STORAGE] content_type:", content_type)
-    print("[STORAGE] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
-
-    if not FIREBASE_STORAGE_BUCKET:
-        raise RuntimeError("Falta FIREBASE_STORAGE_BUCKET en Environment")
-
+def archivo_a_data_url(local_path, content_type="image/jpeg"):
     if not os.path.exists(local_path):
-        raise RuntimeError(f"No existe el archivo local a subir: {local_path}")
+        raise RuntimeError(f"No existe el archivo local: {local_path}")
 
-    try:
-        bucket = storage.bucket()
-        print("[STORAGE] bucket.name:", bucket.name)
+    with open(local_path, "rb") as f:
+        contenido = f.read()
 
-        if not bucket.name:
-            raise RuntimeError("El bucket de Firebase Storage no está configurado correctamente")
+    if not contenido:
+        raise RuntimeError("El archivo está vacío")
 
-        blob = bucket.blob(remote_path)
-        blob.upload_from_filename(local_path, content_type=content_type)
-        blob.make_public()
-
-        print("[STORAGE] Archivo subido correctamente")
-        print("[STORAGE] URL pública:", blob.public_url)
-
-        return {
-            "storage_path": remote_path,
-            "public_url": blob.public_url
-        }
-
-    except Exception as e:
-        print("[STORAGE] Error al subir archivo:", type(e).__name__, str(e))
-        raise
+    b64 = base64.b64encode(contenido).decode("utf-8")
+    return f"data:{content_type};base64,{b64}"
 
 
 # =========================================================
@@ -845,18 +820,13 @@ def api_worker_order_photo(order_id):
         if tam == 0:
             raise RuntimeError("El archivo guardado quedó vacío")
 
-        remote_path = f"pedidos/{order_id}/{nombre_final}"
-        storage_info = subir_archivo_a_firebase_storage(
-            local_path=ruta_local,
-            remote_path=remote_path,
-            content_type=archivo.mimetype or "image/jpeg"
-        )
+        content_type = archivo.mimetype or "image/jpeg"
+        data_url = archivo_a_data_url(ruta_local, content_type)
 
         foto_info = {
             "nombre": nombre_final,
-            "url": storage_info["public_url"],
-            "storage_path": storage_info["storage_path"],
-            "url_local": f"/fotos/{nombre_final}",
+            "url": data_url,
+            "content_type": content_type,
             "fecha": fecha,
             "hora": hora,
             "fecha_hora": f"{fecha} {hora}",
@@ -872,7 +842,12 @@ def api_worker_order_photo(order_id):
             "updated_at": now.isoformat()
         })
 
-        print("[PHOTO] Foto guardada correctamente en pedido:", order_id)
+        try:
+            os.remove(ruta_local)
+        except Exception as e:
+            print("[PHOTO] No se pudo borrar archivo temporal:", e)
+
+        print("[PHOTO] Foto guardada correctamente en Firestore para pedido:", order_id)
 
         return jsonify({
             "ok": True,
@@ -1057,19 +1032,14 @@ def subir_foto():
         if tam == 0:
             raise RuntimeError("El archivo guardado quedó vacío")
 
-        remote_path = f"usuarios/{usuario}/{nombre_final}"
-        storage_info = subir_archivo_a_firebase_storage(
-            local_path=ruta_local,
-            remote_path=remote_path,
-            content_type=archivo.mimetype or "image/jpeg"
-        )
+        content_type = archivo.mimetype or "image/jpeg"
+        data_url = archivo_a_data_url(ruta_local, content_type)
 
         foto_info = {
             "usuario": usuario,
             "nombre": nombre_final,
-            "ruta": storage_info["public_url"],
-            "storage_path": storage_info["storage_path"],
-            "ruta_local": f"/fotos/{nombre_final}",
+            "url": data_url,
+            "content_type": content_type,
             "fecha": fecha,
             "hora": hora,
             "etiqueta": f"{usuario}_{fecha}_{hora}",
@@ -1078,7 +1048,12 @@ def subir_foto():
 
         fotos_ref.push(foto_info)
 
-        print("[SUBIR_FOTO] Foto guardada correctamente para usuario:", usuario)
+        try:
+            os.remove(ruta_local)
+        except Exception as e:
+            print("[SUBIR_FOTO] No se pudo borrar archivo temporal:", e)
+
+        print("[SUBIR_FOTO] Foto guardada correctamente en Firestore para usuario:", usuario)
 
         return jsonify({
             "ok": True,
@@ -1107,7 +1082,7 @@ def fotos_usuario(usuario):
                 lista.append({
                     "usuario": foto.get("usuario", ""),
                     "nombre": foto.get("nombre", ""),
-                    "url": foto.get("ruta", ""),
+                    "url": foto.get("url", ""),
                     "fecha": foto.get("fecha", ""),
                     "hora": foto.get("hora", ""),
                     "etiqueta": foto.get("etiqueta", "")
