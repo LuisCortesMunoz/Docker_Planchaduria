@@ -30,12 +30,12 @@ FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://db-planchaduria-def
 FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
 
-SMTP_HOST = smtp.gmail.com
-SMTP_PORT = 587
-SMTP_USER = lucorts06@gmail.com
-SMTP_PASS = "dbbsncwyoddzitym"
-SMTP_FROM = lucorts06@gmail.com
-SMTP_USE_TLS = true
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
 
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
