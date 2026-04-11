@@ -33,7 +33,7 @@ ADMIN_UID = os.environ.get("ADMIN_UID", "")
 SMTP_HOST = smtp.gmail.com
 SMTP_PORT = 587
 SMTP_USER = lucorts06@gmail.com
-SMTP_PASS = gacr cjfr bknt pbyd
+SMTP_PASS = "dbbsncwyoddzitym"
 SMTP_FROM = lucorts06@gmail.com
 SMTP_USE_TLS = true
 
