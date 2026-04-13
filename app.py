@@ -6,10 +6,7 @@ from firebase_admin import credentials, firestore, db, auth as firebase_auth
 import os
 import requests
 import base64
-import secrets
-import smtplib
-from email.message import EmailMessage
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from functools import wraps
 
@@ -30,18 +27,8 @@ FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://db-planchaduria-def
 FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
-SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
-
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
-print("[CONFIG] SMTP_HOST:", SMTP_HOST)
-print("[CONFIG] SMTP_PORT:", SMTP_PORT)
-print("[CONFIG] SMTP_FROM:", SMTP_FROM)
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -133,8 +120,7 @@ def user_doc_to_json(doc):
         "nombreCompleto": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
         "email": data.get("email", ""),
         "telefono": data.get("telefono", ""),
-        "created_at": data.get("created_at", ""),
-        "emailVerified": data.get("emailVerified", False)
+        "created_at": data.get("created_at", "")
     }
 
 
@@ -183,82 +169,27 @@ def archivo_a_data_url(local_path, content_type="image/jpeg"):
 
 
 # =========================================================
-# VERIFICACIÓN DE CORREO
-# =========================================================
-def generate_verification_code():
-    return str(secrets.randbelow(900000) + 100000)
-
-
-def verification_doc_ref(uid):
-    return fs.collection("email_verifications").document(uid)
-
-
-def parse_iso_datetime(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except Exception:
-        return None
-
-
-def send_email_smtp(to_email, subject, body_text):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
-        raise RuntimeError("Faltan variables SMTP en Environment")
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
-    msg.set_content(body_text)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.ehlo()
-        if SMTP_USE_TLS:
-            server.starttls()
-            server.ehlo()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-
-
-def create_or_refresh_verification(uid, email, nombre):
-    code = generate_verification_code()
-    created_at = now_mx()
-    expires_at = created_at + timedelta(minutes=15)
-
-    verification_doc_ref(uid).set({
-        "uid": uid,
-        "email": email,
-        "nombre": nombre,
-        "code": code,
-        "used": False,
-        "attempts": 0,
-        "created_at": created_at.isoformat(),
-        "expires_at": expires_at.isoformat()
-    })
-
-    body = f"""
-Hola {nombre or 'usuario'}:
-
-Tu código de verificación para Planchaduría es:
-
-{code}
-
-Este código vence en 15 minutos.
-
-Si tú no solicitaste esta cuenta, puedes ignorar este correo.
-""".strip()
-
-    send_email_smtp(
-        to_email=email,
-        subject="Código de verificación - Planchaduría",
-        body_text=body
-    )
-
-
-# =========================================================
 # FIREBASE AUTH REST
 # =========================================================
+def firebase_sign_up(email, password):
+    if not FIREBASE_WEB_API_KEY:
+        raise RuntimeError("Falta FIREBASE_WEB_API_KEY en Environment")
+
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_WEB_API_KEY}"
+    resp = requests.post(url, json={
+        "email": email,
+        "password": password,
+        "returnSecureToken": True
+    }, timeout=30)
+
+    data = resp.json()
+
+    if resp.status_code != 200:
+        raise RuntimeError(data.get("error", {}).get("message", "No se pudo registrar"))
+
+    return data
+
+
 def firebase_sign_in(email, password):
     if not FIREBASE_WEB_API_KEY:
         raise RuntimeError("Falta FIREBASE_WEB_API_KEY en Environment")
@@ -390,159 +321,35 @@ def api_register():
         return fail("La contraseña debe tener al menos 6 caracteres", 400)
 
     try:
-        nombre_completo = f"{nombre} {apellido}".strip()
-
-        try:
-            existing_user = firebase_auth.get_user_by_email(email)
-
-            if existing_user.email_verified:
-                return fail("Este correo ya está registrado y validado.", 400)
-
-            firebase_auth.update_user(
-                existing_user.uid,
-                password=password,
-                display_name=nombre_completo
-            )
-            uid = existing_user.uid
-
-        except firebase_auth.UserNotFoundError:
-            new_user = firebase_auth.create_user(
-                email=email,
-                password=password,
-                display_name=nombre_completo,
-                email_verified=False
-            )
-            uid = new_user.uid
+        auth_data = firebase_sign_up(email, password)
+        uid = auth_data.get("localId", "")
 
         fs.collection("usuarios").document(uid).set({
             "nombre": nombre,
             "apellido": apellido,
             "email": email,
             "telefono": telefono,
-            "emailVerified": False,
             "created_at": now_mx().isoformat()
-        }, merge=True)
-
-        create_or_refresh_verification(uid, email, nombre_completo)
-
-        return jsonify({
-            "ok": True,
-            "message": "Te enviamos un código de verificación a tu correo.",
-            "requiresVerification": True,
-            "email": email
-        }), 200
-
-    except Exception as e:
-        return fail(auth_error_message(str(e)), 400)
-
-
-@app.route("/api/auth/resend-code", methods=["POST"])
-def api_resend_code():
-    data = request.get_json(silent=True) or {}
-    email = str(data.get("email", "")).strip().lower()
-
-    if not email:
-        return fail("Debes indicar el correo", 400)
-
-    try:
-        user = firebase_auth.get_user_by_email(email)
-
-        if user.email_verified:
-            return fail("Este correo ya fue validado.", 400)
-
-        user_doc = fs.collection("usuarios").document(user.uid).get()
-        user_data = user_doc.to_dict() if user_doc.exists else {}
-        nombre_completo = f"{user_data.get('nombre', '')} {user_data.get('apellido', '')}".strip()
-
-        create_or_refresh_verification(user.uid, email, nombre_completo)
-
-        return jsonify({
-            "ok": True,
-            "message": "Te enviamos un nuevo código de verificación."
-        }), 200
-
-    except firebase_auth.UserNotFoundError:
-        return fail("Correo no registrado.", 404)
-    except Exception as e:
-        return fail(auth_error_message(str(e)), 400)
-
-
-@app.route("/api/auth/verify-email-code", methods=["POST"])
-def api_verify_email_code():
-    data = request.get_json(silent=True) or {}
-
-    email = str(data.get("email", "")).strip().lower()
-    password = str(data.get("password", "")).strip()
-    code = str(data.get("code", "")).strip()
-
-    if not email or not password or not code:
-        return fail("Debes enviar correo, contraseña y código", 400)
-
-    if not code.isdigit() or len(code) != 6:
-        return fail("El código debe tener 6 dígitos", 400)
-
-    try:
-        user = firebase_auth.get_user_by_email(email)
-        vref = verification_doc_ref(user.uid)
-        vsnap = vref.get()
-
-        if not vsnap.exists:
-            return fail("No existe una verificación pendiente para este correo.", 404)
-
-        vdata = vsnap.to_dict() or {}
-
-        if vdata.get("used", False):
-            return fail("Este código ya fue utilizado.", 400)
-
-        expires_at = parse_iso_datetime(vdata.get("expires_at"))
-        if not expires_at or now_mx() > expires_at:
-            return fail("El código expiró. Solicita uno nuevo.", 400)
-
-        if str(vdata.get("email", "")).lower() != email:
-            return fail("El correo no coincide con la verificación.", 400)
-
-        if str(vdata.get("code", "")).strip() != code:
-            current_attempts = int(vdata.get("attempts", 0)) + 1
-            vref.update({"attempts": current_attempts})
-            return fail("Código incorrecto.", 400)
-
-        firebase_auth.update_user(user.uid, email_verified=True)
-
-        fs.collection("usuarios").document(user.uid).set({
-            "emailVerified": True,
-            "updated_at": now_mx().isoformat()
-        }, merge=True)
-
-        vref.update({
-            "used": True,
-            "verified_at": now_mx().isoformat()
         })
 
-        auth_data = firebase_sign_in(email, password)
-
-        profile_doc = fs.collection("usuarios").document(user.uid).get()
-        profile = profile_doc.to_dict() if profile_doc.exists else {}
-
-        user_json = {
-            "uid": user.uid,
-            "nombre": profile.get("nombre", ""),
-            "apellido": profile.get("apellido", ""),
-            "nombreCompleto": f"{profile.get('nombre', '')} {profile.get('apellido', '')}".strip(),
-            "email": profile.get("email", email),
-            "telefono": profile.get("telefono", ""),
-            "isAdmin": is_admin_uid(user.uid)
+        user = {
+            "uid": uid,
+            "nombre": nombre,
+            "apellido": apellido,
+            "nombreCompleto": f"{nombre} {apellido}".strip(),
+            "email": email,
+            "telefono": telefono,
+            "isAdmin": is_admin_uid(uid)
         }
 
         return jsonify({
             "ok": True,
-            "message": "Correo validado correctamente",
+            "message": "Cuenta creada correctamente",
             "token": auth_data.get("idToken"),
             "refreshToken": auth_data.get("refreshToken"),
-            "user": user_json
+            "user": user
         }), 200
 
-    except firebase_auth.UserNotFoundError:
-        return fail("Correo no registrado.", 404)
     except Exception as e:
         return fail(auth_error_message(str(e)), 400)
 
@@ -560,10 +367,6 @@ def api_login():
     try:
         auth_data = firebase_sign_in(email, password)
         uid = auth_data.get("localId", "")
-
-        fb_user = firebase_auth.get_user(uid)
-        if not fb_user.email_verified:
-            return fail("Debes validar tu correo antes de iniciar sesión.", 403)
 
         doc = fs.collection("usuarios").document(uid).get()
         profile = doc.to_dict() if doc.exists else {}
