@@ -1,3 +1,5 @@
+# app.py
+
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -38,7 +40,7 @@ if not firebase_admin._apps:
 
 fs = firestore.client()
 
-# Realtime DB para rutina y fotos generales
+# Realtime DB
 estado_ref = db.reference("estado_actual")
 historial_ref = db.reference("historial")
 fotos_ref = db.reference("fotos")
@@ -248,7 +250,7 @@ def generate_folio():
 
 
 # =========================================================
-# ESTADO MEMORIA PARA RUTINA ANTERIOR
+# ESTADO MEMORIA
 # =========================================================
 def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
     global estado_memoria
@@ -754,7 +756,8 @@ def api_worker_order_status(order_id):
 
     if estado == "en_proceso":
         payload["rutina_activa"] = True
-        payload["started_at"] = now_mx().isoformat()
+        if not (snap.to_dict() or {}).get("started_at"):
+            payload["started_at"] = now_mx().isoformat()
 
     if estado == "planchado":
         payload["rutina_activa"] = True
@@ -782,6 +785,8 @@ def api_worker_order_status(order_id):
 
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
+    ruta_local = None
+
     try:
         print(f"[PHOTO] Iniciando carga de foto para pedido: {order_id}")
 
@@ -842,6 +847,11 @@ def api_worker_order_photo(order_id):
             "updated_at": now.isoformat()
         })
 
+        fotos_ref.push({
+            "order_id": order_id,
+            **foto_info
+        })
+
         try:
             os.remove(ruta_local)
         except Exception as e:
@@ -858,6 +868,13 @@ def api_worker_order_photo(order_id):
     except Exception as e:
         print("[PHOTO] Error en /api/worker/orders/<order_id>/photo:", type(e).__name__, str(e))
         return fail(f"Error interno al guardar la foto: {type(e).__name__}: {e}", 500)
+
+    finally:
+        if ruta_local and os.path.exists(ruta_local):
+            try:
+                os.remove(ruta_local)
+            except Exception:
+                pass
 
 
 @app.route("/api/worker/orders/<order_id>/complete", methods=["POST"])
@@ -964,14 +981,19 @@ def set_cantidad():
 def activar_plc():
     data = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
+    cantidad = int(data.get("cantidad", 0))
 
-    if not usuario:
-        return fail("Debes enviar usuario", 400)
+    if not usuario or not usuario.isdigit() or len(usuario) > 5:
+        return fail("Usuario inválido", 400)
+
+    if cantidad < 0:
+        return fail("Cantidad inválida", 400)
 
     guardar_estado(
         usuario=usuario,
+        cantidad=cantidad,
         activo=True,
-        estado=f"Motor continuo activo para usuario {usuario}"
+        estado=f"Proceso activado para usuario {usuario}"
     )
 
     return jsonify({
@@ -981,135 +1003,33 @@ def activar_plc():
     }), 200
 
 
-@app.route("/desactivar_plc", methods=["POST"])
-def desactivar_plc():
-    guardar_estado(
-        activo=False,
-        estado="PLC desactivado"
-    )
+@app.route("/reiniciar", methods=["POST"])
+def reiniciar_estado():
+    guardar_estado(usuario="", cantidad=0, activo=False, estado="Esperando trabajo")
 
     return jsonify({
         "ok": True,
-        "message": "PLC desactivado correctamente",
+        "message": "Estado reiniciado correctamente",
         "data": estado_memoria
     }), 200
 
 
-@app.route("/subir_foto", methods=["POST"])
-def subir_foto():
-    try:
-        if "foto" not in request.files:
-            return fail("No se recibió archivo", 400)
-
-        usuario = str(request.form.get("usuario", "")).strip()
-
-        if not usuario.isdigit() or len(usuario) > 5:
-            return fail("Usuario inválido", 400)
-
-        archivo = request.files["foto"]
-
-        if archivo.filename == "":
-            return fail("Archivo vacío", 400)
-
-        now = now_mx()
-        fecha = now.strftime("%Y-%m-%d")
-        hora = now.strftime("%H:%M:%S")
-        stamp = now.strftime("%Y%m%d_%H%M%S")
-
-        nombre_seguro = secure_filename(archivo.filename)
-        nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
-        ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
-
-        print("[SUBIR_FOTO] Guardando archivo temporal en:", ruta_local)
-        archivo.save(ruta_local)
-
-        if not os.path.exists(ruta_local):
-            raise RuntimeError("No se pudo guardar el archivo temporalmente")
-
-        tam = os.path.getsize(ruta_local)
-        print("[SUBIR_FOTO] Tamaño archivo local:", tam)
-
-        if tam == 0:
-            raise RuntimeError("El archivo guardado quedó vacío")
-
-        content_type = archivo.mimetype or "image/jpeg"
-        data_url = archivo_a_data_url(ruta_local, content_type)
-
-        foto_info = {
-            "usuario": usuario,
-            "nombre": nombre_final,
-            "url": data_url,
-            "content_type": content_type,
-            "fecha": fecha,
-            "hora": hora,
-            "etiqueta": f"{usuario}_{fecha}_{hora}",
-            "timestamp": now.isoformat()
-        }
-
-        fotos_ref.push(foto_info)
-
-        try:
-            os.remove(ruta_local)
-        except Exception as e:
-            print("[SUBIR_FOTO] No se pudo borrar archivo temporal:", e)
-
-        print("[SUBIR_FOTO] Foto guardada correctamente en Firestore para usuario:", usuario)
-
-        return jsonify({
-            "ok": True,
-            "message": "Foto subida correctamente",
-            "foto": foto_info
-        }), 200
-
-    except Exception as e:
-        print("[SUBIR_FOTO] Error:", type(e).__name__, str(e))
-        return fail(f"Error interno al subir la foto: {type(e).__name__}: {e}", 500)
-
-
-@app.route("/fotos_usuario/<usuario>", methods=["GET"])
-def fotos_usuario(usuario):
-    usuario = str(usuario).strip()
-
-    if not usuario.isdigit() or len(usuario) > 5:
-        return fail("Usuario inválido", 400)
-
-    data = fotos_ref.get()
-    lista = []
-
-    if data:
-        for _, foto in data.items():
-            if str(foto.get("usuario", "")) == usuario:
-                lista.append({
-                    "usuario": foto.get("usuario", ""),
-                    "nombre": foto.get("nombre", ""),
-                    "url": foto.get("url", ""),
-                    "fecha": foto.get("fecha", ""),
-                    "hora": foto.get("hora", ""),
-                    "etiqueta": foto.get("etiqueta", "")
-                })
-
-    lista.sort(key=lambda x: x["nombre"], reverse=True)
+@app.route("/process/current", methods=["GET"])
+def process_current():
+    docs = fs.collection("pedidos").where("Estado", "in", ["en_proceso", "planchado"]).stream()
+    items = [order_doc_to_json(doc) for doc in docs]
+    items.sort(key=lambda x: x.get("Contador", 0))
 
     return jsonify({
         "ok": True,
-        "usuario": usuario,
-        "total": len(lista),
-        "fotos": lista
+        "current": items[0] if items else None,
+        "estado_memoria": estado_memoria
     }), 200
 
 
-@app.route("/fotos/<nombre_archivo>", methods=["GET"])
-def ver_foto(nombre_archivo):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], nombre_archivo)
-
-
-@app.route("/historial", methods=["GET"])
-def historial():
-    data = historial_ref.get()
-    return jsonify({
-        "ok": True,
-        "data": data if data else {}
-    }), 200
+@app.route("/fotos/<path:filename>", methods=["GET"])
+def serve_photo(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
 # =========================================================
@@ -1117,4 +1037,4 @@ def historial():
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
