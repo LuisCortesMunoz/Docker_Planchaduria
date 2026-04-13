@@ -1,13 +1,14 @@
+# ================================
 # app.py
-
+# ================================
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import firebase_admin
 from firebase_admin import credentials, firestore, db, auth as firebase_auth
 import os
-import requests
 import base64
+import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from functools import wraps
@@ -40,7 +41,6 @@ if not firebase_admin._apps:
 
 fs = firestore.client()
 
-# Realtime DB
 estado_ref = db.reference("estado_actual")
 historial_ref = db.reference("historial")
 fotos_ref = db.reference("fotos")
@@ -54,7 +54,7 @@ estado_memoria = {
 }
 
 # =========================================================
-# HELPERS GENERALES
+# HELPERS
 # =========================================================
 def now_mx():
     return datetime.now(ZoneInfo("America/Mexico_City"))
@@ -113,6 +113,20 @@ def require_auth(admin=False):
     return decorator
 
 
+def archivo_a_data_url(local_path, content_type="image/jpeg"):
+    if not os.path.exists(local_path):
+        raise RuntimeError(f"No existe el archivo local: {local_path}")
+
+    with open(local_path, "rb") as f:
+        contenido = f.read()
+
+    if not contenido:
+        raise RuntimeError("El archivo está vacío")
+
+    b64 = base64.b64encode(contenido).decode("utf-8")
+    return f"data:{content_type};base64,{b64}"
+
+
 def user_doc_to_json(doc):
     data = doc.to_dict() or {}
     return {
@@ -154,21 +168,6 @@ def order_doc_to_json(doc):
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", "")
     }
-
-
-def archivo_a_data_url(local_path, content_type="image/jpeg"):
-    if not os.path.exists(local_path):
-        raise RuntimeError(f"No existe el archivo local: {local_path}")
-
-    with open(local_path, "rb") as f:
-        contenido = f.read()
-
-    if not contenido:
-        raise RuntimeError("El archivo está vacío")
-
-    b64 = base64.b64encode(contenido).decode("utf-8")
-    return f"data:{content_type};base64,{b64}"
-
 
 # =========================================================
 # FIREBASE AUTH REST
@@ -223,7 +222,6 @@ def auth_error_message(raw_message):
     }
     return mapping.get(raw_message, raw_message)
 
-
 # =========================================================
 # CONTADOR DE FOLIOS
 # =========================================================
@@ -248,7 +246,6 @@ def generate_folio():
     folio = "#" + str(contador).zfill(5)
     return folio, contador
 
-
 # =========================================================
 # ESTADO MEMORIA
 # =========================================================
@@ -270,7 +267,6 @@ def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
     estado_memoria["updated_at"] = now_mx().isoformat()
 
     estado_ref.set(estado_memoria)
-
     historial_ref.push({
         "usuario_actual": estado_memoria["usuario_actual"],
         "cantidad": estado_memoria["cantidad"],
@@ -301,7 +297,6 @@ def home():
         "ok": True,
         "message": "Backend Render activo"
     })
-
 
 # =========================================================
 # AUTH
@@ -417,7 +412,6 @@ def api_me():
         "user": user
     }), 200
 
-
 # =========================================================
 # PEDIDOS CLIENTE
 # =========================================================
@@ -494,7 +488,6 @@ def api_create_order_client():
 @require_auth(admin=False)
 def api_orders_my():
     uid = request.user_uid
-
     docs = fs.collection("pedidos").where("clienteUid", "==", uid).stream()
     items = [order_doc_to_json(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
@@ -508,7 +501,6 @@ def api_orders_my():
 @app.route("/api/orders/track/<folio>", methods=["GET"])
 def api_orders_track(folio):
     folio = str(folio).strip().upper()
-
     docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
 
     if not docs:
@@ -518,7 +510,6 @@ def api_orders_track(folio):
         "ok": True,
         "order": order_doc_to_json(docs[0])
     }), 200
-
 
 # =========================================================
 # ADMIN PEDIDOS
@@ -629,7 +620,6 @@ def api_admin_orders_update(order_id):
         payload["Validado"] = payload["Estado"] == "entregado"
 
     payload["updated_at"] = now_mx().isoformat()
-
     doc_ref.update(payload)
 
     return jsonify({
@@ -680,7 +670,6 @@ def api_admin_clients():
         "ok": True,
         "clients": clients
     }), 200
-
 
 # =========================================================
 # ENDPOINTS WORKER NUEVOS
@@ -735,13 +724,7 @@ def api_worker_order_status(order_id):
     data = request.get_json(silent=True) or {}
     estado = str(data.get("Estado", data.get("estado", ""))).strip()
 
-    estados_validos = {
-        "pendiente",
-        "en_proceso",
-        "planchado",
-        "listo",
-        "entregado"
-    }
+    estados_validos = {"pendiente", "en_proceso", "planchado", "listo", "entregado"}
 
     if not estado:
         return fail("Debes enviar el estado", 400)
@@ -756,8 +739,7 @@ def api_worker_order_status(order_id):
 
     if estado == "en_proceso":
         payload["rutina_activa"] = True
-        if not (snap.to_dict() or {}).get("started_at"):
-            payload["started_at"] = now_mx().isoformat()
+        payload["started_at"] = now_mx().isoformat()
 
     if estado == "planchado":
         payload["rutina_activa"] = True
@@ -785,8 +767,6 @@ def api_worker_order_status(order_id):
 
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
-    ruta_local = None
-
     try:
         print(f"[PHOTO] Iniciando carga de foto para pedido: {order_id}")
 
@@ -847,10 +827,13 @@ def api_worker_order_photo(order_id):
             "updated_at": now.isoformat()
         })
 
-        fotos_ref.push({
-            "order_id": order_id,
-            **foto_info
-        })
+        try:
+            fotos_ref.push({
+                "order_id": order_id,
+                **foto_info
+            })
+        except Exception as e:
+            print("[PHOTO] Aviso al guardar copia en RTDB:", e)
 
         try:
             os.remove(ruta_local)
@@ -868,13 +851,6 @@ def api_worker_order_photo(order_id):
     except Exception as e:
         print("[PHOTO] Error en /api/worker/orders/<order_id>/photo:", type(e).__name__, str(e))
         return fail(f"Error interno al guardar la foto: {type(e).__name__}: {e}", 500)
-
-    finally:
-        if ruta_local and os.path.exists(ruta_local):
-            try:
-                os.remove(ruta_local)
-            except Exception:
-                pass
 
 
 @app.route("/api/worker/orders/<order_id>/complete", methods=["POST"])
@@ -921,9 +897,8 @@ def api_worker_order_error(order_id):
         "message": "Error registrado"
     }), 200
 
-
 # =========================================================
-# ENDPOINTS ANTIGUOS DE RUTINA
+# ENDPOINTS ANTIGUOS
 # =========================================================
 @app.route("/estado", methods=["GET"])
 def obtener_estado():
@@ -953,7 +928,6 @@ def set_usuario():
 @app.route("/set_cantidad", methods=["POST"])
 def set_cantidad():
     data = request.get_json(silent=True) or {}
-
     usuario = str(data.get("usuario", "")).strip()
     cantidad = data.get("cantidad", None)
 
@@ -981,19 +955,14 @@ def set_cantidad():
 def activar_plc():
     data = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
-    cantidad = int(data.get("cantidad", 0))
 
-    if not usuario or not usuario.isdigit() or len(usuario) > 5:
-        return fail("Usuario inválido", 400)
-
-    if cantidad < 0:
-        return fail("Cantidad inválida", 400)
+    if not usuario:
+        return fail("Debes enviar usuario", 400)
 
     guardar_estado(
         usuario=usuario,
-        cantidad=cantidad,
         activo=True,
-        estado=f"Proceso activado para usuario {usuario}"
+        estado=f"Motor continuo activo para usuario {usuario}"
     )
 
     return jsonify({
@@ -1003,38 +972,118 @@ def activar_plc():
     }), 200
 
 
-@app.route("/reiniciar", methods=["POST"])
-def reiniciar_estado():
-    guardar_estado(usuario="", cantidad=0, activo=False, estado="Esperando trabajo")
+@app.route("/desactivar_plc", methods=["POST"])
+def desactivar_plc():
+    guardar_estado(
+        activo=False,
+        estado="PLC desactivado"
+    )
 
     return jsonify({
         "ok": True,
-        "message": "Estado reiniciado correctamente",
+        "message": "PLC desactivado correctamente",
         "data": estado_memoria
     }), 200
 
 
-@app.route("/process/current", methods=["GET"])
-def process_current():
-    docs = fs.collection("pedidos").where("Estado", "in", ["en_proceso", "planchado"]).stream()
-    items = [order_doc_to_json(doc) for doc in docs]
-    items.sort(key=lambda x: x.get("Contador", 0))
+@app.route("/subir_foto", methods=["POST"])
+def subir_foto():
+    try:
+        if "foto" not in request.files:
+            return fail("No se recibió archivo", 400)
+
+        usuario = str(request.form.get("usuario", "")).strip()
+
+        if not usuario.isdigit() or len(usuario) > 5:
+            return fail("Usuario inválido", 400)
+
+        archivo = request.files["foto"]
+
+        if archivo.filename == "":
+            return fail("Archivo vacío", 400)
+
+        now = now_mx()
+        fecha = now.strftime("%Y-%m-%d")
+        hora = now.strftime("%H:%M:%S")
+        stamp = now.strftime("%Y%m%d_%H%M%S")
+
+        nombre_seguro = secure_filename(archivo.filename)
+        nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
+        ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+
+        print("[SUBIR_FOTO] Guardando archivo temporal en:", ruta_local)
+        archivo.save(ruta_local)
+
+        if not os.path.exists(ruta_local):
+            raise RuntimeError("No se pudo guardar el archivo temporalmente")
+
+        tam = os.path.getsize(ruta_local)
+        print("[SUBIR_FOTO] Tamaño archivo local:", tam)
+
+        if tam == 0:
+            raise RuntimeError("El archivo guardado quedó vacío")
+
+        content_type = archivo.mimetype or "image/jpeg"
+        data_url = archivo_a_data_url(ruta_local, content_type)
+
+        foto_info = {
+            "usuario": usuario,
+            "nombre": nombre_final,
+            "url": data_url,
+            "content_type": content_type,
+            "fecha": fecha,
+            "hora": hora,
+            "etiqueta": f"{usuario}_{fecha}_{hora}",
+            "timestamp": now.isoformat()
+        }
+
+        fotos_ref.push(foto_info)
+
+        try:
+            os.remove(ruta_local)
+        except Exception as e:
+            print("[SUBIR_FOTO] No se pudo borrar archivo temporal:", e)
+
+        print("[SUBIR_FOTO] Foto guardada correctamente en Firestore para usuario:", usuario)
+
+        return jsonify({
+            "ok": True,
+            "message": "Foto subida correctamente",
+            "foto": foto_info
+        }), 200
+
+    except Exception as e:
+        print("[SUBIR_FOTO] Error:", type(e).__name__, str(e))
+        return fail(f"Error interno al subir la foto: {type(e).__name__}: {e}", 500)
+
+
+@app.route("/fotos_usuario/<usuario>", methods=["GET"])
+def fotos_usuario(usuario):
+    usuario = str(usuario).strip()
+
+    if not usuario.isdigit() or len(usuario) > 5:
+        return fail("Usuario inválido", 400)
+
+    data = fotos_ref.get() or {}
+    items = []
+
+    for _, item in data.items():
+        if str(item.get("usuario", "")).strip() == usuario:
+            items.append(item)
+
+    items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
 
     return jsonify({
         "ok": True,
-        "current": items[0] if items else None,
-        "estado_memoria": estado_memoria
+        "fotos": items
     }), 200
 
 
-@app.route("/fotos/<path:filename>", methods=["GET"])
-def serve_photo(filename):
+@app.route("/uploads/<path:filename>", methods=["GET"])
+def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
-# =========================================================
-# MAIN
-# =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
