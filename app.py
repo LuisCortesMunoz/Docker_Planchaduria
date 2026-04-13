@@ -1,5 +1,5 @@
 # ================================
-# app.py
+# app.py corregido
 # ================================
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -7,7 +7,6 @@ from werkzeug.utils import secure_filename
 import firebase_admin
 from firebase_admin import credentials, firestore, db, auth as firebase_auth
 import os
-import base64
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -61,20 +60,14 @@ def now_mx():
 
 
 def ok_json(payload=None, message="OK", status=200):
-    body = {
-        "ok": True,
-        "message": message
-    }
+    body = {"ok": True, "message": message}
     if payload:
         body.update(payload)
     return jsonify(body), status
 
 
 def fail(message="Error", status=400):
-    return jsonify({
-        "ok": False,
-        "message": message
-    }), status
+    return jsonify({"ok": False, "message": message}), status
 
 
 def is_admin_uid(uid):
@@ -113,18 +106,9 @@ def require_auth(admin=False):
     return decorator
 
 
-def archivo_a_data_url(local_path, content_type="image/jpeg"):
-    if not os.path.exists(local_path):
-        raise RuntimeError(f"No existe el archivo local: {local_path}")
-
-    with open(local_path, "rb") as f:
-        contenido = f.read()
-
-    if not contenido:
-        raise RuntimeError("El archivo está vacío")
-
-    b64 = base64.b64encode(contenido).decode("utf-8")
-    return f"data:{content_type};base64,{b64}"
+def public_file_url(filename: str) -> str:
+    base = request.host_url.rstrip("/")
+    return f"{base}/uploads/{filename}"
 
 
 def user_doc_to_json(doc):
@@ -142,6 +126,10 @@ def user_doc_to_json(doc):
 
 def order_doc_to_json(doc):
     data = doc.to_dict() or {}
+    fotos = data.get("fotos", [])
+    if not isinstance(fotos, list):
+        fotos = []
+
     return {
         "id": doc.id,
         "Folio": data.get("Folio", ""),
@@ -160,7 +148,7 @@ def order_doc_to_json(doc):
         "Validado": data.get("Validado", False),
         "origenCliente": data.get("origenCliente", False),
         "FolioIngresado": data.get("FolioIngresado", ""),
-        "fotos": data.get("fotos", []),
+        "fotos": fotos,
         "rutina_activa": data.get("rutina_activa", False),
         "started_at": data.get("started_at", ""),
         "completed_at": data.get("completed_at", ""),
@@ -681,15 +669,9 @@ def api_worker_next_order():
     items.sort(key=lambda x: x.get("Contador", 0))
 
     if not items:
-        return jsonify({
-            "ok": True,
-            "order": None
-        }), 200
+        return jsonify({"ok": True, "order": None}), 200
 
-    return jsonify({
-        "ok": True,
-        "order": items[0]
-    }), 200
+    return jsonify({"ok": True, "order": items[0]}), 200
 
 
 @app.route("/api/worker/orders/<order_id>/start", methods=["POST"])
@@ -787,17 +769,17 @@ def api_worker_order_photo(order_id):
         now = now_mx()
         fecha = now.strftime("%Y-%m-%d")
         hora = now.strftime("%H:%M:%S")
-        stamp = now.strftime("%Y%m%d_%H%M%S")
+        stamp = now.strftime("%Y%m%d_%H%M%S_%f")
 
         nombre_seguro = secure_filename(archivo.filename)
         nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
         ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-        print("[PHOTO] Guardando archivo temporal en:", ruta_local)
+        print("[PHOTO] Guardando archivo en:", ruta_local)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
-            raise RuntimeError("No se pudo guardar el archivo temporalmente")
+            raise RuntimeError("No se pudo guardar el archivo")
 
         tam = os.path.getsize(ruta_local)
         print("[PHOTO] Tamaño archivo local:", tam)
@@ -806,20 +788,24 @@ def api_worker_order_photo(order_id):
             raise RuntimeError("El archivo guardado quedó vacío")
 
         content_type = archivo.mimetype or "image/jpeg"
-        data_url = archivo_a_data_url(ruta_local, content_type)
 
         foto_info = {
             "nombre": nombre_final,
-            "url": data_url,
+            "url": public_file_url(nombre_final),
+            "relative_url": f"/uploads/{nombre_final}",
             "content_type": content_type,
             "fecha": fecha,
             "hora": hora,
             "fecha_hora": f"{fecha} {hora}",
-            "timestamp": now.isoformat()
+            "timestamp": now.isoformat(),
+            "size_bytes": tam
         }
 
         data = snap.to_dict() or {}
         fotos = data.get("fotos", [])
+        if not isinstance(fotos, list):
+            fotos = []
+
         fotos.append(foto_info)
 
         doc_ref.update({
@@ -835,12 +821,7 @@ def api_worker_order_photo(order_id):
         except Exception as e:
             print("[PHOTO] Aviso al guardar copia en RTDB:", e)
 
-        try:
-            os.remove(ruta_local)
-        except Exception as e:
-            print("[PHOTO] No se pudo borrar archivo temporal:", e)
-
-        print("[PHOTO] Foto guardada correctamente en Firestore para pedido:", order_id)
+        print("[PHOTO] Foto guardada correctamente para pedido:", order_id)
 
         return jsonify({
             "ok": True,
@@ -1005,17 +986,17 @@ def subir_foto():
         now = now_mx()
         fecha = now.strftime("%Y-%m-%d")
         hora = now.strftime("%H:%M:%S")
-        stamp = now.strftime("%Y%m%d_%H%M%S")
+        stamp = now.strftime("%Y%m%d_%H%M%S_%f")
 
         nombre_seguro = secure_filename(archivo.filename)
         nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
         ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-        print("[SUBIR_FOTO] Guardando archivo temporal en:", ruta_local)
+        print("[SUBIR_FOTO] Guardando archivo en:", ruta_local)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
-            raise RuntimeError("No se pudo guardar el archivo temporalmente")
+            raise RuntimeError("No se pudo guardar el archivo")
 
         tam = os.path.getsize(ruta_local)
         print("[SUBIR_FOTO] Tamaño archivo local:", tam)
@@ -1024,27 +1005,23 @@ def subir_foto():
             raise RuntimeError("El archivo guardado quedó vacío")
 
         content_type = archivo.mimetype or "image/jpeg"
-        data_url = archivo_a_data_url(ruta_local, content_type)
 
         foto_info = {
             "usuario": usuario,
             "nombre": nombre_final,
-            "url": data_url,
+            "url": public_file_url(nombre_final),
+            "relative_url": f"/uploads/{nombre_final}",
             "content_type": content_type,
             "fecha": fecha,
             "hora": hora,
             "etiqueta": f"{usuario}_{fecha}_{hora}",
-            "timestamp": now.isoformat()
+            "timestamp": now.isoformat(),
+            "size_bytes": tam
         }
 
         fotos_ref.push(foto_info)
 
-        try:
-            os.remove(ruta_local)
-        except Exception as e:
-            print("[SUBIR_FOTO] No se pudo borrar archivo temporal:", e)
-
-        print("[SUBIR_FOTO] Foto guardada correctamente en Firestore para usuario:", usuario)
+        print("[SUBIR_FOTO] Foto guardada correctamente para usuario:", usuario)
 
         return jsonify({
             "ok": True,
