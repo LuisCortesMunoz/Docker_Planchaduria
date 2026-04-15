@@ -1,11 +1,11 @@
 # ================================
 # app.py
 # ================================
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import firebase_admin
-from firebase_admin import credentials, firestore, db, auth as firebase_auth
+from firebase_admin import credentials, firestore, db, auth as firebase_auth, storage
 import os
 import requests
 from datetime import datetime
@@ -18,7 +18,7 @@ from functools import wraps
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = "fotos"
+UPLOAD_FOLDER = "fotos_temp"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -27,15 +27,18 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 FIREBASE_CRED_FILE = os.environ.get("FIREBASE_CRED_FILE", "/etc/secrets/serviceAccountKey.json")
 FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://db-planchaduria-default-rtdb.firebaseio.com")
 FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
+FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "TU_BUCKET_REAL.firebasestorage.app")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
 
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
+print("[CONFIG] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
     firebase_admin.initialize_app(cred, {
-        "databaseURL": FIREBASE_DB_URL
+        "databaseURL": FIREBASE_DB_URL,
+        "storageBucket": FIREBASE_STORAGE_BUCKET
     })
 
 fs = firestore.client()
@@ -104,11 +107,6 @@ def require_auth(admin=False):
             return fn(*args, **kwargs)
         return wrapper
     return decorator
-
-
-def public_file_url(filename: str) -> str:
-    base = request.host_url.rstrip("/")
-    return f"{base}/uploads/{filename}"
 
 
 def user_doc_to_json(doc):
@@ -279,7 +277,6 @@ def cargar_estado():
 
 cargar_estado()
 
-
 # =========================================================
 # HOME
 # =========================================================
@@ -289,7 +286,6 @@ def home():
         "ok": True,
         "message": "Backend Render activo"
     })
-
 
 # =========================================================
 # AUTH
@@ -405,7 +401,6 @@ def api_me():
         "user": user
     }), 200
 
-
 # =========================================================
 # PEDIDOS CLIENTE
 # =========================================================
@@ -504,7 +499,6 @@ def api_orders_track(folio):
         "ok": True,
         "order": order_doc_to_json(docs[0])
     }), 200
-
 
 # =========================================================
 # ADMIN PEDIDOS
@@ -666,7 +660,6 @@ def api_admin_clients():
         "clients": clients
     }), 200
 
-
 # =========================================================
 # ENDPOINTS WORKER
 # =========================================================
@@ -757,6 +750,7 @@ def api_worker_order_status(order_id):
 
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
+    ruta_local = ""
     try:
         print(f"[PHOTO] Iniciando carga de foto para pedido: {order_id}")
 
@@ -783,11 +777,11 @@ def api_worker_order_photo(order_id):
         nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
         ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-        print("[PHOTO] Guardando archivo en:", ruta_local)
+        print("[PHOTO] Guardando temporal en:", ruta_local)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
-            raise RuntimeError("No se pudo guardar el archivo")
+            raise RuntimeError("No se pudo guardar el archivo temporal")
 
         tam = os.path.getsize(ruta_local)
         print("[PHOTO] Tamaño archivo local:", tam)
@@ -797,16 +791,21 @@ def api_worker_order_photo(order_id):
 
         content_type = archivo.mimetype or "image/jpeg"
 
+        bucket = storage.bucket()
+        blob = bucket.blob(f"pedidos/{order_id}/{nombre_final}")
+        blob.upload_from_filename(ruta_local, content_type=content_type)
+        blob.make_public()
+
         foto_info = {
             "nombre": nombre_final,
-            "url": public_file_url(nombre_final),
-            "relative_url": f"/uploads/{nombre_final}",
+            "url": blob.public_url,
             "content_type": content_type,
             "fecha": fecha,
             "hora": hora,
             "fecha_hora": f"{fecha} {hora}",
             "timestamp": now.isoformat(),
-            "size_bytes": tam
+            "size_bytes": tam,
+            "storage_path": blob.name
         }
 
         data = snap.to_dict() or {}
@@ -829,7 +828,7 @@ def api_worker_order_photo(order_id):
         except Exception as e:
             print("[PHOTO] Aviso al guardar copia en RTDB:", e)
 
-        print("[PHOTO] Foto guardada correctamente para pedido:", order_id)
+        print("[PHOTO] Foto guardada correctamente en Storage para pedido:", order_id)
 
         return jsonify({
             "ok": True,
@@ -838,8 +837,15 @@ def api_worker_order_photo(order_id):
         }), 200
 
     except Exception as e:
-        print("[PHOTO] Error en /api/worker/orders/<order_id>/photo:", type(e).__name__, str(e))
+        print("[PHOTO] Error:", type(e).__name__, str(e))
         return fail(f"Error interno al guardar la foto: {type(e).__name__}: {e}", 500)
+
+    finally:
+        if ruta_local and os.path.exists(ruta_local):
+            try:
+                os.remove(ruta_local)
+            except Exception as e:
+                print("[PHOTO] No se pudo borrar temporal:", e)
 
 
 @app.route("/api/worker/orders/<order_id>/complete", methods=["POST"])
@@ -885,7 +891,6 @@ def api_worker_order_error(order_id):
         "ok": True,
         "message": "Error registrado"
     }), 200
-
 
 # =========================================================
 # ENDPOINTS LEGACY
@@ -978,6 +983,7 @@ def desactivar_plc():
 
 @app.route("/subir_foto", methods=["POST"])
 def subir_foto():
+    ruta_local = ""
     try:
         if "foto" not in request.files:
             return fail("No se recibió archivo", 400)
@@ -1001,7 +1007,7 @@ def subir_foto():
         nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
         ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
 
-        print("[SUBIR_FOTO] Guardando archivo en:", ruta_local)
+        print("[SUBIR_FOTO] Guardando temporal en:", ruta_local)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
@@ -1015,17 +1021,22 @@ def subir_foto():
 
         content_type = archivo.mimetype or "image/jpeg"
 
+        bucket = storage.bucket()
+        blob = bucket.blob(f"usuarios/{usuario}/{nombre_final}")
+        blob.upload_from_filename(ruta_local, content_type=content_type)
+        blob.make_public()
+
         foto_info = {
             "usuario": usuario,
             "nombre": nombre_final,
-            "url": public_file_url(nombre_final),
-            "relative_url": f"/uploads/{nombre_final}",
+            "url": blob.public_url,
             "content_type": content_type,
             "fecha": fecha,
             "hora": hora,
             "etiqueta": f"{usuario}_{fecha}_{hora}",
             "timestamp": now.isoformat(),
-            "size_bytes": tam
+            "size_bytes": tam,
+            "storage_path": blob.name
         }
 
         fotos_ref.push(foto_info)
@@ -1041,6 +1052,13 @@ def subir_foto():
     except Exception as e:
         print("[SUBIR_FOTO] Error:", type(e).__name__, str(e))
         return fail(f"Error interno al subir la foto: {type(e).__name__}: {e}", 500)
+
+    finally:
+        if ruta_local and os.path.exists(ruta_local):
+            try:
+                os.remove(ruta_local)
+            except Exception as e:
+                print("[SUBIR_FOTO] No se pudo borrar temporal:", e)
 
 
 @app.route("/fotos_usuario/<usuario>", methods=["GET"])
@@ -1063,11 +1081,6 @@ def fotos_usuario(usuario):
         "ok": True,
         "fotos": items
     }), 200
-
-
-@app.route("/uploads/<path:filename>", methods=["GET"])
-def uploaded_file(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
 if __name__ == "__main__":
