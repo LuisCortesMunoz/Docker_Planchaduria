@@ -56,6 +56,14 @@ estado_memoria = {
 }
 
 # =========================================================
+# HORA DE ARRANQUE DEL BACKEND
+# =========================================================
+BACKEND_START_TIME = datetime.now(ZoneInfo("America/Mexico_City"))
+BACKEND_START_TIME_ISO = BACKEND_START_TIME.isoformat()
+
+print("[INIT] Backend arrancó en:", BACKEND_START_TIME_ISO)
+
+# =========================================================
 # HELPERS
 # =========================================================
 def now_mx():
@@ -107,6 +115,31 @@ def require_auth(admin=False):
             return fn(*args, **kwargs)
         return wrapper
     return decorator
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def was_created_after_backend_start(created_at_value):
+    dt = parse_iso_datetime(created_at_value)
+
+    if dt is None:
+        return False
+
+    try:
+        return dt >= BACKEND_START_TIME
+    except Exception:
+        return False
 
 
 def user_doc_to_json(doc):
@@ -284,7 +317,8 @@ cargar_estado()
 def home():
     return jsonify({
         "ok": True,
-        "message": "Backend Render activo"
+        "message": "Backend Render activo",
+        "backend_start_time": BACKEND_START_TIME_ISO
     })
 
 # =========================================================
@@ -434,6 +468,8 @@ def api_create_order_client():
 
     folio, contador = generate_folio()
 
+    ahora = now_mx().isoformat()
+
     payload = {
         "Folio": folio,
         "Contador": contador,
@@ -456,8 +492,8 @@ def api_create_order_client():
         "started_at": "",
         "completed_at": "",
         "ultimo_error": "",
-        "created_at": now_mx().isoformat(),
-        "updated_at": now_mx().isoformat()
+        "created_at": ahora,
+        "updated_at": ahora
     }
 
     ref = fs.collection("pedidos").document()
@@ -545,6 +581,8 @@ def api_admin_orders_create():
 
     folio, contador = generate_folio()
 
+    ahora = now_mx().isoformat()
+
     payload = {
         "Folio": folio,
         "Contador": contador,
@@ -567,8 +605,8 @@ def api_admin_orders_create():
         "started_at": "",
         "completed_at": "",
         "ultimo_error": "",
-        "created_at": now_mx().isoformat(),
-        "updated_at": now_mx().isoformat()
+        "created_at": ahora,
+        "updated_at": ahora
     }
 
     ref = fs.collection("pedidos").document()
@@ -666,12 +704,30 @@ def api_admin_clients():
 @app.route("/api/worker/next-order", methods=["GET"])
 def api_worker_next_order():
     docs = fs.collection("pedidos").where("Estado", "==", "pendiente").stream()
-    items = [order_doc_to_json(doc) for doc in docs]
+    items = []
+
+    for doc in docs:
+        item = order_doc_to_json(doc)
+        created_at = item.get("created_at", "")
+
+        if not was_created_after_backend_start(created_at):
+            print(
+                f"[WORKER] Ignorando pedido viejo: "
+                f"{item.get('Folio', '')} | created_at={created_at} | backend_start={BACKEND_START_TIME_ISO}"
+            )
+            continue
+
+        items.append(item)
+
     items.sort(key=lambda x: x.get("Contador", 0))
 
     if not items:
         return jsonify({"ok": True, "order": None}), 200
 
+    print(
+        f"[WORKER] Entregando pedido nuevo: "
+        f"{items[0].get('Folio', '')} | created_at={items[0].get('created_at', '')}"
+    )
     return jsonify({"ok": True, "order": items[0]}), 200
 
 
@@ -899,7 +955,8 @@ def api_worker_order_error(order_id):
 def obtener_estado():
     return jsonify({
         "ok": True,
-        "data": estado_memoria
+        "data": estado_memoria,
+        "backend_start_time": BACKEND_START_TIME_ISO
     })
 
 
