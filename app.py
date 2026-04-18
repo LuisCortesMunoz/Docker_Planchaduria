@@ -43,6 +43,8 @@ SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() == "true"
 
 REGISTER_CODE_MINUTES = 10
 REGISTER_MAX_ATTEMPTS = 5
+RESET_CODE_MINUTES = 10
+RESET_MAX_ATTEMPTS = 5
 
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
@@ -226,6 +228,9 @@ def auth_error_message(raw_message):
     return mapping.get(raw_message, raw_message)
 
 
+# =========================================================
+# FIREBASE AUTH REST
+# =========================================================
 def firebase_sign_in(email, password):
     if not FIREBASE_WEB_API_KEY:
         raise RuntimeError("Falta FIREBASE_WEB_API_KEY en Environment")
@@ -245,12 +250,19 @@ def firebase_sign_in(email, password):
     return data
 
 
-def generate_register_code():
+# =========================================================
+# HELPERS REGISTRO / RESET
+# =========================================================
+def generate_six_digit_code():
     return f"{random.randint(0, 999999):06d}"
 
 
 def registration_doc_ref(email):
     return fs.collection("pending_registrations").document(normalize_email(email))
+
+
+def reset_doc_ref(email):
+    return fs.collection("pending_password_resets").document(normalize_email(email))
 
 
 def email_exists_in_firebase(email):
@@ -262,6 +274,11 @@ def email_exists_in_firebase(email):
         return False
     except Exception:
         raise
+
+
+def get_firebase_user_by_email(email):
+    email = normalize_email(email)
+    return firebase_auth.get_user_by_email(email)
 
 
 def send_email_smtp(to_email, subject, html_body, text_body=""):
@@ -288,9 +305,8 @@ def send_email_smtp(to_email, subject, html_body, text_body=""):
 
 
 def send_register_code_email(to_email, nombre, code):
-    subject = "Código de verificación - Planchado Express"
-
     display_name = str(nombre or "").strip() or "usuario"
+    subject = "Código de verificación - Planchado Express"
 
     text_body = (
         f"Hola {display_name},\n\n"
@@ -316,12 +332,36 @@ def send_register_code_email(to_email, nombre, code):
     </html>
     """
 
-    send_email_smtp(
-        to_email=to_email,
-        subject=subject,
-        html_body=html_body,
-        text_body=text_body
+    send_email_smtp(to_email, subject, html_body, text_body)
+
+
+def send_reset_code_email(to_email, code):
+    subject = "Código para recuperar tu contraseña - Planchado Express"
+
+    text_body = (
+        f"Hola,\n\n"
+        f"Tu código para recuperar tu contraseña es: {code}\n"
+        f"Este código expira en {RESET_CODE_MINUTES} minutos.\n\n"
+        f"Si tú no solicitaste este cambio, puedes ignorar este correo.\n"
     )
+
+    html_body = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; color:#222;">
+        <div style="max-width:520px; margin:0 auto; padding:24px; border:1px solid #eee; border-radius:16px;">
+          <h2 style="color:#e63329; margin-top:0;">Planchado Express</h2>
+          <p>Tu código para recuperar tu contraseña es:</p>
+          <div style="font-size:32px; font-weight:700; letter-spacing:6px; text-align:center; margin:24px 0; color:#111;">
+            {code}
+          </div>
+          <p>Este código expira en <strong>{RESET_CODE_MINUTES} minutos</strong>.</p>
+          <p>Si tú no solicitaste este cambio, puedes ignorar este correo.</p>
+        </div>
+      </body>
+    </html>
+    """
+
+    send_email_smtp(to_email, subject, html_body, text_body)
 
 
 def create_firebase_user(email, password, nombre, apellido):
@@ -411,7 +451,7 @@ def home():
     })
 
 # =========================================================
-# AUTH
+# AUTH REGISTRO CON CÓDIGO
 # =========================================================
 @app.route("/api/auth/request-register-code", methods=["POST"])
 def api_request_register_code():
@@ -433,7 +473,7 @@ def api_request_register_code():
         if email_exists_in_firebase(email):
             return fail("Este correo ya está registrado.", 400)
 
-        code = generate_register_code()
+        code = generate_six_digit_code()
         now = now_mx()
         expires_at = now + timedelta(minutes=REGISTER_CODE_MINUTES)
 
@@ -462,6 +502,7 @@ def api_request_register_code():
     except Exception as e:
         print("[REGISTER_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo enviar el código: {e}", 500)
+
 
 @app.route("/api/auth/verify-register-code", methods=["POST"])
 def api_verify_register_code():
@@ -523,7 +564,6 @@ def api_verify_register_code():
             "created_at": now_mx().isoformat()
         })
 
-        # iniciar sesión automáticamente
         auth_data = firebase_sign_in(email, password)
 
         user = {
@@ -572,7 +612,7 @@ def api_resend_register_code():
             doc_ref.delete()
             return fail("Este correo ya está registrado.", 400)
 
-        code = generate_register_code()
+        code = generate_six_digit_code()
         now = now_mx()
         expires_at = now + timedelta(minutes=REGISTER_CODE_MINUTES)
 
@@ -605,6 +645,216 @@ def api_register():
     return fail("Usa /api/auth/request-register-code para iniciar el registro con código", 400)
 
 
+# =========================================================
+# AUTH RECUPERAR CONTRASEÑA
+# =========================================================
+@app.route("/api/auth/request-reset-code", methods=["POST"])
+def api_request_reset_code():
+    data = request.get_json(silent=True) or {}
+    email = normalize_email(data.get("email", ""))
+
+    if not email:
+        return fail("Debes enviar el correo", 400)
+
+    try:
+        user = get_firebase_user_by_email(email)
+
+        code = generate_six_digit_code()
+        now = now_mx()
+        expires_at = now + timedelta(minutes=RESET_CODE_MINUTES)
+
+        reset_doc_ref(email).set({
+            "email": email,
+            "uid": user.uid,
+            "code": code,
+            "attempts": 0,
+            "verified": False,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "code_expires_at": expires_at.isoformat()
+        })
+
+        send_reset_code_email(email, code)
+
+        return jsonify({
+            "ok": True,
+            "message": "Te enviamos un código para recuperar tu contraseña.",
+            "email": email
+        }), 200
+
+    except firebase_auth.UserNotFoundError:
+        return fail("Correo no registrado.", 404)
+    except Exception as e:
+        print("[REQUEST_RESET_CODE] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo enviar el código de recuperación: {e}", 500)
+
+
+@app.route("/api/auth/verify-reset-code", methods=["POST"])
+def api_verify_reset_code():
+    data = request.get_json(silent=True) or {}
+    email = normalize_email(data.get("email", ""))
+    code = str(data.get("code", "")).strip()
+
+    if not email or not code:
+        return fail("Debes enviar correo y código", 400)
+
+    try:
+        doc_ref = reset_doc_ref(email)
+        snap = doc_ref.get()
+
+        if not snap.exists:
+            return fail("No existe una solicitud de recuperación para este correo", 404)
+
+        reg = snap.to_dict() or {}
+
+        attempts = int(reg.get("attempts", 0))
+        if attempts >= RESET_MAX_ATTEMPTS:
+            return fail("Se alcanzó el máximo de intentos. Solicita un nuevo código.", 400)
+
+        expires_at = parse_iso_datetime(reg.get("code_expires_at"))
+        if not expires_at or now_mx() > expires_at:
+            return fail("El código expiró. Solicita uno nuevo.", 400)
+
+        if str(reg.get("code", "")).strip() != code:
+            doc_ref.update({
+                "attempts": attempts + 1,
+                "updated_at": now_mx().isoformat()
+            })
+            return fail("Código incorrecto", 400)
+
+        doc_ref.update({
+            "verified": True,
+            "updated_at": now_mx().isoformat()
+        })
+
+        return jsonify({
+            "ok": True,
+            "message": "Código correcto. Ahora escribe tu nueva contraseña."
+        }), 200
+
+    except Exception as e:
+        print("[VERIFY_RESET_CODE] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo verificar el código: {e}", 500)
+
+
+@app.route("/api/auth/confirm-reset-password", methods=["POST"])
+def api_confirm_reset_password():
+    data = request.get_json(silent=True) or {}
+
+    email = normalize_email(data.get("email", ""))
+    code = str(data.get("code", "")).strip()
+    new_password = str(data.get("newPassword", "")).strip()
+
+    if not email or not code or not new_password:
+        return fail("Debes enviar correo, código y nueva contraseña", 400)
+
+    if len(new_password) < 6:
+        return fail("La nueva contraseña debe tener al menos 6 caracteres", 400)
+
+    try:
+        doc_ref = reset_doc_ref(email)
+        snap = doc_ref.get()
+
+        if not snap.exists:
+            return fail("No existe una solicitud de recuperación para este correo", 404)
+
+        reg = snap.to_dict() or {}
+
+        expires_at = parse_iso_datetime(reg.get("code_expires_at"))
+        if not expires_at or now_mx() > expires_at:
+            return fail("El código expiró. Solicita uno nuevo.", 400)
+
+        if not reg.get("verified", False):
+            return fail("Primero debes validar el código de recuperación.", 400)
+
+        if str(reg.get("code", "")).strip() != code:
+            return fail("Código incorrecto", 400)
+
+        uid = str(reg.get("uid", "")).strip()
+        if not uid:
+            return fail("No se encontró el usuario para actualizar contraseña.", 400)
+
+        firebase_auth.update_user(uid, password=new_password)
+
+        auth_data = firebase_sign_in(email, new_password)
+
+        user_doc = fs.collection("usuarios").document(uid).get()
+        profile = user_doc.to_dict() if user_doc.exists else {}
+
+        user = {
+            "uid": uid,
+            "nombre": profile.get("nombre", ""),
+            "apellido": profile.get("apellido", ""),
+            "nombreCompleto": f"{profile.get('nombre', '')} {profile.get('apellido', '')}".strip(),
+            "email": profile.get("email", email),
+            "telefono": profile.get("telefono", ""),
+            "isAdmin": is_admin_uid(uid)
+        }
+
+        doc_ref.delete()
+
+        return jsonify({
+            "ok": True,
+            "message": "Contraseña actualizada correctamente.",
+            "token": auth_data.get("idToken"),
+            "refreshToken": auth_data.get("refreshToken"),
+            "user": user
+        }), 200
+
+    except Exception as e:
+        print("[CONFIRM_RESET_PASSWORD] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo actualizar la contraseña: {e}", 500)
+
+
+@app.route("/api/auth/resend-reset-code", methods=["POST"])
+def api_resend_reset_code():
+    data = request.get_json(silent=True) or {}
+    email = normalize_email(data.get("email", ""))
+
+    if not email:
+        return fail("Debes enviar el correo", 400)
+
+    try:
+        doc_ref = reset_doc_ref(email)
+        snap = doc_ref.get()
+
+        if not snap.exists:
+            return fail("No existe una solicitud de recuperación para este correo", 404)
+
+        reg = snap.to_dict() or {}
+
+        # Verifica que el usuario siga existiendo
+        get_firebase_user_by_email(email)
+
+        code = generate_six_digit_code()
+        now = now_mx()
+        expires_at = now + timedelta(minutes=RESET_CODE_MINUTES)
+
+        doc_ref.update({
+            "code": code,
+            "attempts": 0,
+            "verified": False,
+            "updated_at": now.isoformat(),
+            "code_expires_at": expires_at.isoformat()
+        })
+
+        send_reset_code_email(email, code)
+
+        return jsonify({
+            "ok": True,
+            "message": "Te enviamos un nuevo código de recuperación."
+        }), 200
+
+    except firebase_auth.UserNotFoundError:
+        return fail("Correo no registrado.", 404)
+    except Exception as e:
+        print("[RESEND_RESET_CODE] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo reenviar el código de recuperación: {e}", 500)
+
+
+# =========================================================
+# AUTH LOGIN / ME
+# =========================================================
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
