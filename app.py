@@ -8,7 +8,11 @@ import firebase_admin
 from firebase_admin import credentials, firestore, db, auth as firebase_auth, storage
 import os
 import requests
-from datetime import datetime
+import random
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
 
@@ -30,9 +34,22 @@ FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
 FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "TU_BUCKET_REAL.firebasestorage.app")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
 
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER).strip()
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() == "true"
+
+REGISTER_CODE_MINUTES = 10
+REGISTER_MAX_ATTEMPTS = 5
+
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
 print("[CONFIG] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
+print("[CONFIG] SMTP_HOST:", SMTP_HOST)
+print("[CONFIG] SMTP_PORT:", SMTP_PORT)
+print("[CONFIG] SMTP_FROM:", SMTP_FROM)
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -77,12 +94,19 @@ def ok_json(payload=None, message="OK", status=200):
     return jsonify(body), status
 
 
-def fail(message="Error", status=400):
-    return jsonify({"ok": False, "message": message}), status
+def fail(message="Error", status=400, extra=None):
+    body = {"ok": False, "message": message}
+    if extra and isinstance(extra, dict):
+        body.update(extra)
+    return jsonify(body), status
 
 
 def is_admin_uid(uid):
     return bool(ADMIN_UID) and uid == ADMIN_UID
+
+
+def normalize_email(email):
+    return str(email or "").strip().lower()
 
 
 def get_bearer_token():
@@ -189,26 +213,17 @@ def order_doc_to_json(doc):
     }
 
 
-# =========================================================
-# FIREBASE AUTH REST
-# =========================================================
-def firebase_sign_up(email, password):
-    if not FIREBASE_WEB_API_KEY:
-        raise RuntimeError("Falta FIREBASE_WEB_API_KEY en Environment")
-
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_WEB_API_KEY}"
-    resp = requests.post(url, json={
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }, timeout=30)
-
-    data = resp.json()
-
-    if resp.status_code != 200:
-        raise RuntimeError(data.get("error", {}).get("message", "No se pudo registrar"))
-
-    return data
+def auth_error_message(raw_message):
+    mapping = {
+        "EMAIL_EXISTS": "Este correo ya está registrado.",
+        "OPERATION_NOT_ALLOWED": "Operación no permitida.",
+        "TOO_MANY_ATTEMPTS_TRY_LATER": "Demasiados intentos. Intenta más tarde.",
+        "EMAIL_NOT_FOUND": "Correo no registrado.",
+        "INVALID_PASSWORD": "Contraseña incorrecta.",
+        "USER_DISABLED": "Usuario deshabilitado.",
+        "INVALID_LOGIN_CREDENTIALS": "Credenciales incorrectas."
+    }
+    return mapping.get(raw_message, raw_message)
 
 
 def firebase_sign_in(email, password):
@@ -230,17 +245,91 @@ def firebase_sign_in(email, password):
     return data
 
 
-def auth_error_message(raw_message):
-    mapping = {
-        "EMAIL_EXISTS": "Este correo ya está registrado.",
-        "OPERATION_NOT_ALLOWED": "Operación no permitida.",
-        "TOO_MANY_ATTEMPTS_TRY_LATER": "Demasiados intentos. Intenta más tarde.",
-        "EMAIL_NOT_FOUND": "Correo no registrado.",
-        "INVALID_PASSWORD": "Contraseña incorrecta.",
-        "USER_DISABLED": "Usuario deshabilitado.",
-        "INVALID_LOGIN_CREDENTIALS": "Credenciales incorrectas."
-    }
-    return mapping.get(raw_message, raw_message)
+def generate_register_code():
+    return f"{random.randint(0, 999999):06d}"
+
+
+def registration_doc_ref(email):
+    return fs.collection("pending_registrations").document(normalize_email(email))
+
+
+def email_exists_in_firebase(email):
+    email = normalize_email(email)
+    try:
+        firebase_auth.get_user_by_email(email)
+        return True
+    except firebase_auth.UserNotFoundError:
+        return False
+    except Exception:
+        raise
+
+
+def send_email_smtp(to_email, subject, html_body, text_body=""):
+    if not SMTP_HOST or not SMTP_PORT or not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
+        raise RuntimeError("Faltan variables SMTP en Environment")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    if text_body:
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.ehlo()
+        if SMTP_USE_TLS:
+            server.starttls()
+            server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+
+
+def send_register_code_email(to_email, nombre, code):
+    subject = "Código de verificación - Planchado Express"
+
+    display_name = str(nombre or "").strip() or "usuario"
+
+    text_body = (
+        f"Hola {display_name},\n\n"
+        f"Tu código de verificación es: {code}\n"
+        f"Este código expira en {REGISTER_CODE_MINUTES} minutos.\n\n"
+        f"Si tú no solicitaste esta cuenta, puedes ignorar este correo.\n"
+    )
+
+    html_body = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; color:#222;">
+        <div style="max-width:520px; margin:0 auto; padding:24px; border:1px solid #eee; border-radius:16px;">
+          <h2 style="color:#e63329; margin-top:0;">Planchado Express</h2>
+          <p>Hola <strong>{display_name}</strong>,</p>
+          <p>Tu código de verificación para crear tu cuenta es:</p>
+          <div style="font-size:32px; font-weight:700; letter-spacing:6px; text-align:center; margin:24px 0; color:#111;">
+            {code}
+          </div>
+          <p>Este código expira en <strong>{REGISTER_CODE_MINUTES} minutos</strong>.</p>
+          <p>Si tú no solicitaste esta cuenta, puedes ignorar este correo.</p>
+        </div>
+      </body>
+    </html>
+    """
+
+    send_email_smtp(
+        to_email=to_email,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body
+    )
+
+
+def create_firebase_user(email, password, nombre, apellido):
+    return firebase_auth.create_user(
+        email=normalize_email(email),
+        password=password,
+        display_name=f"{str(nombre).strip()} {str(apellido).strip()}".strip()
+    )
 
 
 # =========================================================
@@ -324,13 +413,13 @@ def home():
 # =========================================================
 # AUTH
 # =========================================================
-@app.route("/api/auth/register", methods=["POST"])
-def api_register():
+@app.route("/api/auth/request-register-code", methods=["POST"])
+def api_request_register_code():
     data = request.get_json(silent=True) or {}
 
     nombre = str(data.get("nombre", "")).strip()
     apellido = str(data.get("apellido", "")).strip()
-    email = str(data.get("email", "")).strip().lower()
+    email = normalize_email(data.get("email", ""))
     telefono = str(data.get("telefono", "")).strip()
     password = str(data.get("password", "")).strip()
 
@@ -341,8 +430,91 @@ def api_register():
         return fail("La contraseña debe tener al menos 6 caracteres", 400)
 
     try:
-        auth_data = firebase_sign_up(email, password)
-        uid = auth_data.get("localId", "")
+        if email_exists_in_firebase(email):
+            return fail("Este correo ya está registrado.", 400)
+
+        code = generate_register_code()
+        now = now_mx()
+        expires_at = now + timedelta(minutes=REGISTER_CODE_MINUTES)
+
+        registration_doc_ref(email).set({
+            "nombre": nombre,
+            "apellido": apellido,
+            "email": email,
+            "telefono": telefono,
+            "password": password,
+            "code": code,
+            "attempts": 0,
+            "verified": False,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "code_expires_at": expires_at.isoformat()
+        })
+
+        send_register_code_email(email, nombre, code)
+
+        return jsonify({
+            "ok": True,
+            "message": "Te enviamos un código de verificación a tu correo.",
+            "email": email
+        }), 200
+
+    except Exception as e:
+        print("[REGISTER_CODE] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo enviar el código: {e}", 500)
+
+
+@app.route("/api/auth/verify-register-code", methods=["POST"])
+def api_verify_register_code():
+    data = request.get_json(silent=True) or {}
+
+    email = normalize_email(data.get("email", ""))
+    code = str(data.get("code", "")).strip()
+
+    if not email or not code:
+        return fail("Debes enviar correo y código", 400)
+
+    try:
+        doc_ref = registration_doc_ref(email)
+        snap = doc_ref.get()
+
+        if not snap.exists:
+            return fail("No existe un registro pendiente para este correo", 404)
+
+        reg = snap.to_dict() or {}
+
+        if reg.get("verified", False):
+            return fail("Este registro ya fue verificado", 400)
+
+        attempts = int(reg.get("attempts", 0))
+        if attempts >= REGISTER_MAX_ATTEMPTS:
+            return fail("Se alcanzó el máximo de intentos. Solicita un nuevo código.", 400)
+
+        expires_at = parse_iso_datetime(reg.get("code_expires_at"))
+        if not expires_at or now_mx() > expires_at:
+            return fail("El código expiró. Solicita uno nuevo.", 400)
+
+        if str(reg.get("code", "")).strip() != code:
+            doc_ref.update({
+                "attempts": attempts + 1,
+                "updated_at": now_mx().isoformat()
+            })
+            return fail("Código incorrecto", 400)
+
+        if email_exists_in_firebase(email):
+            doc_ref.delete()
+            return fail("Este correo ya está registrado.", 400)
+
+        nombre = str(reg.get("nombre", "")).strip()
+        apellido = str(reg.get("apellido", "")).strip()
+        telefono = str(reg.get("telefono", "")).strip()
+        password = str(reg.get("password", "")).strip()
+
+        if not nombre or not apellido or not password:
+            return fail("El registro temporal está incompleto. Vuelve a registrarte.", 400)
+
+        created_user = create_firebase_user(email, password, nombre, apellido)
+        uid = created_user.uid
 
         fs.collection("usuarios").document(uid).set({
             "nombre": nombre,
@@ -352,33 +524,77 @@ def api_register():
             "created_at": now_mx().isoformat()
         })
 
-        user = {
-            "uid": uid,
-            "nombre": nombre,
-            "apellido": apellido,
-            "nombreCompleto": f"{nombre} {apellido}".strip(),
-            "email": email,
-            "telefono": telefono,
-            "isAdmin": is_admin_uid(uid)
-        }
+        doc_ref.delete()
 
         return jsonify({
             "ok": True,
-            "message": "Cuenta creada correctamente",
-            "token": auth_data.get("idToken"),
-            "refreshToken": auth_data.get("refreshToken"),
-            "user": user
+            "message": "Cuenta creada correctamente. Ya puedes iniciar sesión."
         }), 200
 
     except Exception as e:
-        return fail(auth_error_message(str(e)), 400)
+        print("[VERIFY_REGISTER_CODE] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo verificar el código: {e}", 500)
+
+
+@app.route("/api/auth/resend-register-code", methods=["POST"])
+def api_resend_register_code():
+    data = request.get_json(silent=True) or {}
+    email = normalize_email(data.get("email", ""))
+
+    if not email:
+        return fail("Debes enviar el correo", 400)
+
+    try:
+        doc_ref = registration_doc_ref(email)
+        snap = doc_ref.get()
+
+        if not snap.exists:
+            return fail("No existe un registro pendiente para este correo", 404)
+
+        reg = snap.to_dict() or {}
+
+        if email_exists_in_firebase(email):
+            doc_ref.delete()
+            return fail("Este correo ya está registrado.", 400)
+
+        code = generate_register_code()
+        now = now_mx()
+        expires_at = now + timedelta(minutes=REGISTER_CODE_MINUTES)
+
+        doc_ref.update({
+            "code": code,
+            "attempts": 0,
+            "verified": False,
+            "updated_at": now.isoformat(),
+            "code_expires_at": expires_at.isoformat()
+        })
+
+        send_register_code_email(
+            to_email=email,
+            nombre=reg.get("nombre", ""),
+            code=code
+        )
+
+        return jsonify({
+            "ok": True,
+            "message": "Te enviamos un nuevo código de verificación."
+        }), 200
+
+    except Exception as e:
+        print("[RESEND_REGISTER_CODE] Error:", type(e).__name__, str(e))
+        return fail(f"No se pudo reenviar el código: {e}", 500)
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def api_register():
+    return fail("Usa /api/auth/request-register-code para iniciar el registro con código", 400)
 
 
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
 
-    email = str(data.get("email", "")).strip().lower()
+    email = normalize_email(data.get("email", ""))
     password = str(data.get("password", "")).strip()
 
     if not email or not password:
@@ -502,7 +718,7 @@ def api_create_order_client():
     return jsonify({
         "ok": True,
         "message": "Pedido registrado correctamente",
-        "data": {
+        "order": {
             "id": ref.id,
             **payload
         }
