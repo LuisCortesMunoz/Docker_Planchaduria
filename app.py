@@ -463,7 +463,6 @@ def api_request_register_code():
         print("[REGISTER_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo enviar el código: {e}", 500)
 
-
 @app.route("/api/auth/verify-register-code", methods=["POST"])
 def api_verify_register_code():
     data = request.get_json(silent=True) or {}
@@ -524,11 +523,27 @@ def api_verify_register_code():
             "created_at": now_mx().isoformat()
         })
 
+        # iniciar sesión automáticamente
+        auth_data = firebase_sign_in(email, password)
+
+        user = {
+            "uid": uid,
+            "nombre": nombre,
+            "apellido": apellido,
+            "nombreCompleto": f"{nombre} {apellido}".strip(),
+            "email": email,
+            "telefono": telefono,
+            "isAdmin": is_admin_uid(uid)
+        }
+
         doc_ref.delete()
 
         return jsonify({
             "ok": True,
-            "message": "Cuenta creada correctamente. Ya puedes iniciar sesión."
+            "message": "Cuenta creada correctamente.",
+            "token": auth_data.get("idToken"),
+            "refreshToken": auth_data.get("refreshToken"),
+            "user": user
         }), 200
 
     except Exception as e:
