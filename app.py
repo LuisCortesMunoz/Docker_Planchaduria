@@ -1,5 +1,10 @@
+
 # ================================
 # app.py
+# Backend corregido:
+# - El pedido se crea con QR por folio
+# - La HMI SOLO activa el pedido por folio
+# - La foto real la debe subir la Raspberry al endpoint /api/worker/orders/<order_id>/photo
 # ================================
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -49,9 +54,6 @@ RESET_MAX_ATTEMPTS = 5
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
 print("[CONFIG] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
-print("[CONFIG] SMTP_HOST:", SMTP_HOST)
-print("[CONFIG] SMTP_PORT:", SMTP_PORT)
-print("[CONFIG] SMTP_FROM:", SMTP_FROM)
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -71,7 +73,9 @@ estado_memoria = {
     "cantidad": 0,
     "activo": False,
     "estado": "Esperando trabajo",
-    "updated_at": None
+    "updated_at": None,
+    "current_order_id": "",
+    "current_order_folio": ""
 }
 
 # =========================================================
@@ -80,14 +84,11 @@ estado_memoria = {
 BACKEND_START_TIME = datetime.now(ZoneInfo("America/Mexico_City"))
 BACKEND_START_TIME_ISO = BACKEND_START_TIME.isoformat()
 
-print("[INIT] Backend arrancó en:", BACKEND_START_TIME_ISO)
-
 # =========================================================
 # HELPERS
 # =========================================================
 def now_mx():
     return datetime.now(ZoneInfo("America/Mexico_City"))
-
 
 def ok_json(payload=None, message="OK", status=200):
     body = {"ok": True, "message": message}
@@ -95,28 +96,23 @@ def ok_json(payload=None, message="OK", status=200):
         body.update(payload)
     return jsonify(body), status
 
-
 def fail(message="Error", status=400, extra=None):
     body = {"ok": False, "message": message}
     if extra and isinstance(extra, dict):
         body.update(extra)
     return jsonify(body), status
 
-
 def is_admin_uid(uid):
     return bool(ADMIN_UID) and uid == ADMIN_UID
 
-
 def normalize_email(email):
     return str(email or "").strip().lower()
-
 
 def get_bearer_token():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
     return auth_header.split(" ", 1)[1].strip()
-
 
 def require_auth(admin=False):
     def decorator(fn):
@@ -125,7 +121,6 @@ def require_auth(admin=False):
             token = get_bearer_token()
             if not token:
                 return fail("Falta token de autenticación", 401)
-
             try:
                 decoded = firebase_auth.verify_id_token(token)
             except Exception:
@@ -142,31 +137,24 @@ def require_auth(admin=False):
         return wrapper
     return decorator
 
-
 def parse_iso_datetime(value):
     if not value:
         return None
-
     if isinstance(value, datetime):
         return value
-
     try:
         return datetime.fromisoformat(str(value))
     except Exception:
         return None
 
-
 def was_created_after_backend_start(created_at_value):
     dt = parse_iso_datetime(created_at_value)
-
     if dt is None:
         return False
-
     try:
         return dt >= BACKEND_START_TIME
     except Exception:
         return False
-
 
 def user_doc_to_json(doc):
     data = doc.to_dict() or {}
@@ -179,7 +167,6 @@ def user_doc_to_json(doc):
         "telefono": data.get("telefono", ""),
         "created_at": data.get("created_at", "")
     }
-
 
 def order_doc_to_json(doc):
     data = doc.to_dict() or {}
@@ -207,15 +194,14 @@ def order_doc_to_json(doc):
         "FolioIngresado": data.get("FolioIngresado", ""),
         "fotos": fotos,
         "rutina_activa": data.get("rutina_activa", False),
+        "activado_hmi": data.get("activado_hmi", False),
+        "hmi_activated_at": data.get("hmi_activated_at", ""),
         "started_at": data.get("started_at", ""),
         "completed_at": data.get("completed_at", ""),
         "ultimo_error": data.get("ultimo_error", ""),
         "created_at": data.get("created_at", ""),
-        "updated_at": data.get("updated_at", ""),
-        "activado_hmi": data.get("activado_hmi", False),
-        "hmi_activated_at": data.get("hmi_activated_at", "")
+        "updated_at": data.get("updated_at", "")
     }
-
 
 def auth_error_message(raw_message):
     mapping = {
@@ -228,27 +214,6 @@ def auth_error_message(raw_message):
         "INVALID_LOGIN_CREDENTIALS": "Credenciales incorrectas."
     }
     return mapping.get(raw_message, raw_message)
-
-
-
-def normalize_folio(value):
-    raw = str(value or "").strip().upper()
-    if not raw:
-        return ""
-    return raw if raw.startswith("#") else f"#{raw}"
-
-
-def get_order_doc_by_folio(folio):
-    folio = normalize_folio(folio)
-    if not folio:
-        return None, None
-
-    docs = list(fs.collection("pedidos").where("Folio", "==", folio).limit(1).stream())
-    if not docs:
-        return None, folio
-
-    return docs[0], folio
-
 
 # =========================================================
 # FIREBASE AUTH REST
@@ -271,21 +236,17 @@ def firebase_sign_in(email, password):
 
     return data
 
-
 # =========================================================
 # HELPERS REGISTRO / RESET
 # =========================================================
 def generate_six_digit_code():
     return f"{random.randint(0, 999999):06d}"
 
-
 def registration_doc_ref(email):
     return fs.collection("pending_registrations").document(normalize_email(email))
 
-
 def reset_doc_ref(email):
     return fs.collection("pending_password_resets").document(normalize_email(email))
-
 
 def email_exists_in_firebase(email):
     email = normalize_email(email)
@@ -297,11 +258,9 @@ def email_exists_in_firebase(email):
     except Exception:
         raise
 
-
 def get_firebase_user_by_email(email):
     email = normalize_email(email)
     return firebase_auth.get_user_by_email(email)
-
 
 def send_email_smtp(to_email, subject, html_body, text_body=""):
     if not SMTP_HOST or not SMTP_PORT or not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
@@ -325,66 +284,53 @@ def send_email_smtp(to_email, subject, html_body, text_body=""):
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_FROM, [to_email], msg.as_string())
 
-
 def send_register_code_email(to_email, nombre, code):
     display_name = str(nombre or "").strip() or "usuario"
     subject = "Código de verificación - Planchado Express"
-
     text_body = (
         f"Hola {display_name},\n\n"
         f"Tu código de verificación es: {code}\n"
         f"Este código expira en {REGISTER_CODE_MINUTES} minutos.\n\n"
         f"Si tú no solicitaste esta cuenta, puedes ignorar este correo.\n"
     )
-
     html_body = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; color:#222;">
-        <div style="max-width:520px; margin:0 auto; padding:24px; border:1px solid #eee; border-radius:16px;">
-          <h2 style="color:#e63329; margin-top:0;">Planchado Express</h2>
-          <p>Hola <strong>{display_name}</strong>,</p>
-          <p>Tu código de verificación para crear tu cuenta es:</p>
-          <div style="font-size:32px; font-weight:700; letter-spacing:6px; text-align:center; margin:24px 0; color:#111;">
-            {code}
-          </div>
-          <p>Este código expira en <strong>{REGISTER_CODE_MINUTES} minutos</strong>.</p>
-          <p>Si tú no solicitaste esta cuenta, puedes ignorar este correo.</p>
-        </div>
-      </body>
-    </html>
+    <html><body style="font-family: Arial, sans-serif; color:#222;">
+    <div style="max-width:520px; margin:0 auto; padding:24px; border:1px solid #eee; border-radius:16px;">
+      <h2 style="color:#e63329; margin-top:0;">Planchado Express</h2>
+      <p>Hola <strong>{display_name}</strong>,</p>
+      <p>Tu código de verificación para crear tu cuenta es:</p>
+      <div style="font-size:32px; font-weight:700; letter-spacing:6px; text-align:center; margin:24px 0; color:#111;">
+        {code}
+      </div>
+      <p>Este código expira en <strong>{REGISTER_CODE_MINUTES} minutos</strong>.</p>
+      <p>Si tú no solicitaste esta cuenta, puedes ignorar este correo.</p>
+    </div>
+    </body></html>
     """
-
     send_email_smtp(to_email, subject, html_body, text_body)
-
 
 def send_reset_code_email(to_email, code):
     subject = "Código para recuperar tu contraseña - Planchado Express"
-
     text_body = (
         f"Hola,\n\n"
         f"Tu código para recuperar tu contraseña es: {code}\n"
         f"Este código expira en {RESET_CODE_MINUTES} minutos.\n\n"
         f"Si tú no solicitaste este cambio, puedes ignorar este correo.\n"
     )
-
     html_body = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; color:#222;">
-        <div style="max-width:520px; margin:0 auto; padding:24px; border:1px solid #eee; border-radius:16px;">
-          <h2 style="color:#e63329; margin-top:0;">Planchado Express</h2>
-          <p>Tu código para recuperar tu contraseña es:</p>
-          <div style="font-size:32px; font-weight:700; letter-spacing:6px; text-align:center; margin:24px 0; color:#111;">
-            {code}
-          </div>
-          <p>Este código expira en <strong>{RESET_CODE_MINUTES} minutos</strong>.</p>
-          <p>Si tú no solicitaste este cambio, puedes ignorar este correo.</p>
-        </div>
-      </body>
-    </html>
+    <html><body style="font-family: Arial, sans-serif; color:#222;">
+    <div style="max-width:520px; margin:0 auto; padding:24px; border:1px solid #eee; border-radius:16px;">
+      <h2 style="color:#e63329; margin-top:0;">Planchado Express</h2>
+      <p>Tu código para recuperar tu contraseña es:</p>
+      <div style="font-size:32px; font-weight:700; letter-spacing:6px; text-align:center; margin:24px 0; color:#111;">
+        {code}
+      </div>
+      <p>Este código expira en <strong>{RESET_CODE_MINUTES} minutos</strong>.</p>
+      <p>Si tú no solicitaste este cambio, puedes ignorar este correo.</p>
+    </div>
+    </body></html>
     """
-
     send_email_smtp(to_email, subject, html_body, text_body)
-
 
 def create_firebase_user(email, password, nombre, apellido):
     return firebase_auth.create_user(
@@ -393,7 +339,6 @@ def create_firebase_user(email, password, nombre, apellido):
         display_name=f"{str(nombre).strip()} {str(apellido).strip()}".strip()
     )
 
-
 # =========================================================
 # CONTADOR DE FOLIOS
 # =========================================================
@@ -401,16 +346,10 @@ def create_firebase_user(email, password, nombre, apellido):
 def next_order_counter(transaction):
     counter_ref = fs.collection("counters").document("pedidos")
     snap = counter_ref.get(transaction=transaction)
-
-    if snap.exists:
-        current = snap.to_dict().get("value", 0)
-    else:
-        current = 0
-
+    current = snap.to_dict().get("value", 0) if snap.exists else 0
     new_value = current + 1
     transaction.set(counter_ref, {"value": new_value})
     return new_value
-
 
 def generate_folio():
     transaction = fs.transaction()
@@ -418,24 +357,24 @@ def generate_folio():
     folio = "#" + str(contador).zfill(5)
     return folio, contador
 
-
 # =========================================================
 # ESTADO MEMORIA
 # =========================================================
-def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
+def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None, current_order_id=None, current_order_folio=None):
     global estado_memoria
 
     if usuario is not None:
         estado_memoria["usuario_actual"] = str(usuario)
-
     if cantidad is not None:
         estado_memoria["cantidad"] = int(cantidad)
-
     if activo is not None:
         estado_memoria["activo"] = bool(activo)
-
     if estado is not None:
         estado_memoria["estado"] = estado
+    if current_order_id is not None:
+        estado_memoria["current_order_id"] = str(current_order_id)
+    if current_order_folio is not None:
+        estado_memoria["current_order_folio"] = str(current_order_folio)
 
     estado_memoria["updated_at"] = now_mx().isoformat()
 
@@ -445,9 +384,10 @@ def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None):
         "cantidad": estado_memoria["cantidad"],
         "activo": estado_memoria["activo"],
         "estado": estado_memoria["estado"],
+        "current_order_id": estado_memoria["current_order_id"],
+        "current_order_folio": estado_memoria["current_order_folio"],
         "timestamp": estado_memoria["updated_at"]
     })
-
 
 def cargar_estado():
     global estado_memoria
@@ -457,7 +397,6 @@ def cargar_estado():
             estado_memoria = data
     except Exception as e:
         print("Error al cargar estado:", e)
-
 
 cargar_estado()
 
@@ -478,7 +417,6 @@ def home():
 @app.route("/api/auth/request-register-code", methods=["POST"])
 def api_request_register_code():
     data = request.get_json(silent=True) or {}
-
     nombre = str(data.get("nombre", "")).strip()
     apellido = str(data.get("apellido", "")).strip()
     email = normalize_email(data.get("email", ""))
@@ -487,7 +425,6 @@ def api_request_register_code():
 
     if not nombre or not apellido or not email or not password:
         return fail("Completa todos los campos obligatorios", 400)
-
     if len(password) < 6:
         return fail("La contraseña debe tener al menos 6 caracteres", 400)
 
@@ -514,22 +451,13 @@ def api_request_register_code():
         })
 
         send_register_code_email(email, nombre, code)
-
-        return jsonify({
-            "ok": True,
-            "message": "Te enviamos un código de verificación a tu correo.",
-            "email": email
-        }), 200
-
+        return jsonify({"ok": True, "message": "Te enviamos un código de verificación a tu correo.", "email": email}), 200
     except Exception as e:
-        print("[REGISTER_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo enviar el código: {e}", 500)
-
 
 @app.route("/api/auth/verify-register-code", methods=["POST"])
 def api_verify_register_code():
     data = request.get_json(silent=True) or {}
-
     email = normalize_email(data.get("email", ""))
     code = str(data.get("code", "")).strip()
 
@@ -539,12 +467,10 @@ def api_verify_register_code():
     try:
         doc_ref = registration_doc_ref(email)
         snap = doc_ref.get()
-
         if not snap.exists:
             return fail("No existe un registro pendiente para este correo", 404)
 
         reg = snap.to_dict() or {}
-
         if reg.get("verified", False):
             return fail("Este registro ya fue verificado", 400)
 
@@ -557,10 +483,7 @@ def api_verify_register_code():
             return fail("El código expiró. Solicita uno nuevo.", 400)
 
         if str(reg.get("code", "")).strip() != code:
-            doc_ref.update({
-                "attempts": attempts + 1,
-                "updated_at": now_mx().isoformat()
-            })
+            doc_ref.update({"attempts": attempts + 1, "updated_at": now_mx().isoformat()})
             return fail("Código incorrecto", 400)
 
         if email_exists_in_firebase(email):
@@ -571,9 +494,6 @@ def api_verify_register_code():
         apellido = str(reg.get("apellido", "")).strip()
         telefono = str(reg.get("telefono", "")).strip()
         password = str(reg.get("password", "")).strip()
-
-        if not nombre or not apellido or not password:
-            return fail("El registro temporal está incompleto. Vuelve a registrarte.", 400)
 
         created_user = create_firebase_user(email, password, nombre, apellido)
         uid = created_user.uid
@@ -587,7 +507,6 @@ def api_verify_register_code():
         })
 
         auth_data = firebase_sign_in(email, password)
-
         user = {
             "uid": uid,
             "nombre": nombre,
@@ -599,19 +518,9 @@ def api_verify_register_code():
         }
 
         doc_ref.delete()
-
-        return jsonify({
-            "ok": True,
-            "message": "Cuenta creada correctamente.",
-            "token": auth_data.get("idToken"),
-            "refreshToken": auth_data.get("refreshToken"),
-            "user": user
-        }), 200
-
+        return jsonify({"ok": True, "message": "Cuenta creada correctamente.", "token": auth_data.get("idToken"), "refreshToken": auth_data.get("refreshToken"), "user": user}), 200
     except Exception as e:
-        print("[VERIFY_REGISTER_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo verificar el código: {e}", 500)
-
 
 @app.route("/api/auth/resend-register-code", methods=["POST"])
 def api_resend_register_code():
@@ -624,12 +533,10 @@ def api_resend_register_code():
     try:
         doc_ref = registration_doc_ref(email)
         snap = doc_ref.get()
-
         if not snap.exists:
             return fail("No existe un registro pendiente para este correo", 404)
 
         reg = snap.to_dict() or {}
-
         if email_exists_in_firebase(email):
             doc_ref.delete()
             return fail("Este correo ya está registrado.", 400)
@@ -646,26 +553,14 @@ def api_resend_register_code():
             "code_expires_at": expires_at.isoformat()
         })
 
-        send_register_code_email(
-            to_email=email,
-            nombre=reg.get("nombre", ""),
-            code=code
-        )
-
-        return jsonify({
-            "ok": True,
-            "message": "Te enviamos un nuevo código de verificación."
-        }), 200
-
+        send_register_code_email(email, reg.get("nombre", ""), code)
+        return jsonify({"ok": True, "message": "Te enviamos un nuevo código de verificación."}), 200
     except Exception as e:
-        print("[RESEND_REGISTER_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo reenviar el código: {e}", 500)
-
 
 @app.route("/api/auth/register", methods=["POST"])
 def api_register():
     return fail("Usa /api/auth/request-register-code para iniciar el registro con código", 400)
-
 
 # =========================================================
 # AUTH RECUPERAR CONTRASEÑA
@@ -680,7 +575,6 @@ def api_request_reset_code():
 
     try:
         user = get_firebase_user_by_email(email)
-
         code = generate_six_digit_code()
         now = now_mx()
         expires_at = now + timedelta(minutes=RESET_CODE_MINUTES)
@@ -697,19 +591,11 @@ def api_request_reset_code():
         })
 
         send_reset_code_email(email, code)
-
-        return jsonify({
-            "ok": True,
-            "message": "Te enviamos un código para recuperar tu contraseña.",
-            "email": email
-        }), 200
-
+        return jsonify({"ok": True, "message": "Te enviamos un código para recuperar tu contraseña.", "email": email}), 200
     except firebase_auth.UserNotFoundError:
         return fail("Correo no registrado.", 404)
     except Exception as e:
-        print("[REQUEST_RESET_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo enviar el código de recuperación: {e}", 500)
-
 
 @app.route("/api/auth/verify-reset-code", methods=["POST"])
 def api_verify_reset_code():
@@ -723,12 +609,10 @@ def api_verify_reset_code():
     try:
         doc_ref = reset_doc_ref(email)
         snap = doc_ref.get()
-
         if not snap.exists:
             return fail("No existe una solicitud de recuperación para este correo", 404)
 
         reg = snap.to_dict() or {}
-
         attempts = int(reg.get("attempts", 0))
         if attempts >= RESET_MAX_ATTEMPTS:
             return fail("Se alcanzó el máximo de intentos. Solicita un nuevo código.", 400)
@@ -738,57 +622,38 @@ def api_verify_reset_code():
             return fail("El código expiró. Solicita uno nuevo.", 400)
 
         if str(reg.get("code", "")).strip() != code:
-            doc_ref.update({
-                "attempts": attempts + 1,
-                "updated_at": now_mx().isoformat()
-            })
+            doc_ref.update({"attempts": attempts + 1, "updated_at": now_mx().isoformat()})
             return fail("Código incorrecto", 400)
 
-        doc_ref.update({
-            "verified": True,
-            "updated_at": now_mx().isoformat()
-        })
-
-        return jsonify({
-            "ok": True,
-            "message": "Código correcto. Ahora escribe tu nueva contraseña."
-        }), 200
-
+        doc_ref.update({"verified": True, "updated_at": now_mx().isoformat()})
+        return jsonify({"ok": True, "message": "Código correcto. Ahora escribe tu nueva contraseña."}), 200
     except Exception as e:
-        print("[VERIFY_RESET_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo verificar el código: {e}", 500)
-
 
 @app.route("/api/auth/confirm-reset-password", methods=["POST"])
 def api_confirm_reset_password():
     data = request.get_json(silent=True) or {}
-
     email = normalize_email(data.get("email", ""))
     code = str(data.get("code", "")).strip()
     new_password = str(data.get("newPassword", "")).strip()
 
     if not email or not code or not new_password:
         return fail("Debes enviar correo, código y nueva contraseña", 400)
-
     if len(new_password) < 6:
         return fail("La nueva contraseña debe tener al menos 6 caracteres", 400)
 
     try:
         doc_ref = reset_doc_ref(email)
         snap = doc_ref.get()
-
         if not snap.exists:
             return fail("No existe una solicitud de recuperación para este correo", 404)
 
         reg = snap.to_dict() or {}
-
         expires_at = parse_iso_datetime(reg.get("code_expires_at"))
         if not expires_at or now_mx() > expires_at:
             return fail("El código expiró. Solicita uno nuevo.", 400)
-
         if not reg.get("verified", False):
             return fail("Primero debes validar el código de recuperación.", 400)
-
         if str(reg.get("code", "")).strip() != code:
             return fail("Código incorrecto", 400)
 
@@ -797,7 +662,6 @@ def api_confirm_reset_password():
             return fail("No se encontró el usuario para actualizar contraseña.", 400)
 
         firebase_auth.update_user(uid, password=new_password)
-
         auth_data = firebase_sign_in(email, new_password)
 
         user_doc = fs.collection("usuarios").document(uid).get()
@@ -814,19 +678,9 @@ def api_confirm_reset_password():
         }
 
         doc_ref.delete()
-
-        return jsonify({
-            "ok": True,
-            "message": "Contraseña actualizada correctamente.",
-            "token": auth_data.get("idToken"),
-            "refreshToken": auth_data.get("refreshToken"),
-            "user": user
-        }), 200
-
+        return jsonify({"ok": True, "message": "Contraseña actualizada correctamente.", "token": auth_data.get("idToken"), "refreshToken": auth_data.get("refreshToken"), "user": user}), 200
     except Exception as e:
-        print("[CONFIRM_RESET_PASSWORD] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo actualizar la contraseña: {e}", 500)
-
 
 @app.route("/api/auth/resend-reset-code", methods=["POST"])
 def api_resend_reset_code():
@@ -839,13 +693,9 @@ def api_resend_reset_code():
     try:
         doc_ref = reset_doc_ref(email)
         snap = doc_ref.get()
-
         if not snap.exists:
             return fail("No existe una solicitud de recuperación para este correo", 404)
 
-        reg = snap.to_dict() or {}
-
-        # Verifica que el usuario siga existiendo
         get_firebase_user_by_email(email)
 
         code = generate_six_digit_code()
@@ -861,18 +711,11 @@ def api_resend_reset_code():
         })
 
         send_reset_code_email(email, code)
-
-        return jsonify({
-            "ok": True,
-            "message": "Te enviamos un nuevo código de recuperación."
-        }), 200
-
+        return jsonify({"ok": True, "message": "Te enviamos un nuevo código de recuperación."}), 200
     except firebase_auth.UserNotFoundError:
         return fail("Correo no registrado.", 404)
     except Exception as e:
-        print("[RESEND_RESET_CODE] Error:", type(e).__name__, str(e))
         return fail(f"No se pudo reenviar el código de recuperación: {e}", 500)
-
 
 # =========================================================
 # AUTH LOGIN / ME
@@ -880,7 +723,6 @@ def api_resend_reset_code():
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
-
     email = normalize_email(data.get("email", ""))
     password = str(data.get("password", "")).strip()
 
@@ -890,7 +732,6 @@ def api_login():
     try:
         auth_data = firebase_sign_in(email, password)
         uid = auth_data.get("localId", "")
-
         doc = fs.collection("usuarios").document(uid).get()
         profile = doc.to_dict() if doc.exists else {}
 
@@ -904,17 +745,9 @@ def api_login():
             "isAdmin": is_admin_uid(uid)
         }
 
-        return jsonify({
-            "ok": True,
-            "message": "Inicio de sesión correcto",
-            "token": auth_data.get("idToken"),
-            "refreshToken": auth_data.get("refreshToken"),
-            "user": user
-        }), 200
-
+        return jsonify({"ok": True, "message": "Inicio de sesión correcto", "token": auth_data.get("idToken"), "refreshToken": auth_data.get("refreshToken"), "user": user}), 200
     except Exception as e:
         return fail(auth_error_message(str(e)), 400)
-
 
 @app.route("/api/auth/me", methods=["GET"])
 @require_auth(admin=False)
@@ -933,10 +766,7 @@ def api_me():
         "isAdmin": request.user_is_admin
     }
 
-    return jsonify({
-        "ok": True,
-        "user": user
-    }), 200
+    return jsonify({"ok": True, "user": user}), 200
 
 # =========================================================
 # PEDIDOS CLIENTE
@@ -945,7 +775,6 @@ def api_me():
 @require_auth(admin=False)
 def api_create_order_client():
     data = request.get_json(silent=True) or {}
-
     tipo_prenda = str(data.get("tipoPrenda", "")).strip()
     material = str(data.get("material", "")).strip()
     cantidad = int(data.get("cantidad", 1))
@@ -954,10 +783,8 @@ def api_create_order_client():
 
     if not tipo_prenda:
         return fail("Debes indicar la prenda", 400)
-
     if cantidad < 1:
         return fail("La cantidad debe ser al menos 1", 400)
-
     if not fecha_entrega:
         return fail("Debes indicar la fecha de entrega", 400)
 
@@ -970,7 +797,6 @@ def api_create_order_client():
     cliente_nombre = f"{nombre} {apellido}".strip() or request.user.get("email", "")
 
     folio, contador = generate_folio()
-
     ahora = now_mx().isoformat()
 
     payload = {
@@ -992,27 +818,19 @@ def api_create_order_client():
         "FolioIngresado": folio,
         "fotos": [],
         "rutina_activa": False,
+        "activado_hmi": False,
+        "hmi_activated_at": "",
         "started_at": "",
         "completed_at": "",
         "ultimo_error": "",
         "created_at": ahora,
-        "updated_at": ahora,
-        "activado_hmi": False,
-        "hmi_activated_at": ""
+        "updated_at": ahora
     }
 
     ref = fs.collection("pedidos").document()
     ref.set(payload)
 
-    return jsonify({
-        "ok": True,
-        "message": "Pedido registrado correctamente",
-        "order": {
-            "id": ref.id,
-            **payload
-        }
-    }), 201
-
+    return jsonify({"ok": True, "message": "Pedido registrado correctamente", "order": {"id": ref.id, **payload}}), 201
 
 @app.route("/api/orders/my", methods=["GET"])
 @require_auth(admin=False)
@@ -1021,24 +839,15 @@ def api_orders_my():
     docs = fs.collection("pedidos").where("clienteUid", "==", uid).stream()
     items = [order_doc_to_json(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
-
-    return jsonify({
-        "ok": True,
-        "orders": items
-    }), 200
-
+    return jsonify({"ok": True, "orders": items}), 200
 
 @app.route("/api/orders/track/<folio>", methods=["GET"])
 def api_orders_track(folio):
-    doc, folio_normalizado = get_order_doc_by_folio(folio)
-
-    if not doc:
-        return fail(f"No se encontró ningún pedido con ID {folio_normalizado or folio}", 404)
-
-    return jsonify({
-        "ok": True,
-        "order": order_doc_to_json(doc)
-    }), 200
+    folio = str(folio).strip().upper()
+    docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
+    if not docs:
+        return fail(f"No se encontró ningún pedido con ID {folio}", 404)
+    return jsonify({"ok": True, "order": order_doc_to_json(docs[0])}), 200
 
 # =========================================================
 # ADMIN PEDIDOS
@@ -1049,18 +858,12 @@ def api_admin_orders_list():
     docs = fs.collection("pedidos").stream()
     items = [order_doc_to_json(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
-
-    return jsonify({
-        "ok": True,
-        "orders": items
-    }), 200
-
+    return jsonify({"ok": True, "orders": items}), 200
 
 @app.route("/api/admin/orders", methods=["POST"])
 @require_auth(admin=True)
 def api_admin_orders_create():
     data = request.get_json(silent=True) or {}
-
     cliente = str(data.get("cliente", "")).strip()
     telefono = str(data.get("telefono", "")).strip()
     tipo_prenda = str(data.get("tipoPrenda", "")).strip()
@@ -1073,18 +876,14 @@ def api_admin_orders_create():
 
     if not cliente:
         return fail("El nombre del cliente es obligatorio", 400)
-
     if not tipo_prenda:
         return fail("La prenda es obligatoria", 400)
-
     if cantidad < 1:
         return fail("La cantidad debe ser al menos 1", 400)
-
     if not fecha_ingreso or not fecha_entrega:
         return fail("Debes completar las fechas", 400)
 
     folio, contador = generate_folio()
-
     ahora = now_mx().isoformat()
 
     payload = {
@@ -1106,77 +905,48 @@ def api_admin_orders_create():
         "FolioIngresado": folio,
         "fotos": [],
         "rutina_activa": False,
+        "activado_hmi": False,
+        "hmi_activated_at": "",
         "started_at": "",
         "completed_at": "",
         "ultimo_error": "",
         "created_at": ahora,
-        "updated_at": ahora,
-        "activado_hmi": False,
-        "hmi_activated_at": ""
+        "updated_at": ahora
     }
 
     ref = fs.collection("pedidos").document()
     ref.set(payload)
-
-    return jsonify({
-        "ok": True,
-        "message": "Pedido creado correctamente",
-        "data": {
-            "id": ref.id,
-            **payload
-        }
-    }), 201
-
+    return jsonify({"ok": True, "message": "Pedido creado correctamente", "data": {"id": ref.id, **payload}}), 201
 
 @app.route("/api/admin/orders/<order_id>", methods=["PATCH"])
 @require_auth(admin=True)
 def api_admin_orders_update(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
     snap = doc_ref.get()
-
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
     data = request.get_json(silent=True) or {}
-
-    allowed_keys = {
-        "cliente", "telefono", "tipoPrenda", "material", "cantidad",
-        "precio", "fechaIngreso", "FechaEntrega", "notas", "Estado"
-    }
-
-    payload = {}
-    for key, value in data.items():
-        if key in allowed_keys:
-            payload[key] = value
+    allowed_keys = {"cliente", "telefono", "tipoPrenda", "material", "cantidad", "precio", "fechaIngreso", "FechaEntrega", "notas", "Estado"}
+    payload = {key: value for key, value in data.items() if key in allowed_keys}
 
     if "Estado" in payload:
         payload["Validado"] = payload["Estado"] == "entregado"
 
     payload["updated_at"] = now_mx().isoformat()
     doc_ref.update(payload)
-
-    return jsonify({
-        "ok": True,
-        "message": "Pedido actualizado correctamente"
-    }), 200
-
+    return jsonify({"ok": True, "message": "Pedido actualizado correctamente"}), 200
 
 @app.route("/api/admin/orders/<order_id>", methods=["DELETE"])
 @require_auth(admin=True)
 def api_admin_orders_delete(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
     snap = doc_ref.get()
-
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
     doc_ref.delete()
-
-    return jsonify({
-        "ok": True,
-        "message": "Pedido eliminado correctamente"
-    }), 200
-
+    return jsonify({"ok": True, "message": "Pedido eliminado correctamente"}), 200
 
 @app.route("/api/admin/clients", methods=["GET"])
 @require_auth(admin=True)
@@ -1198,167 +968,163 @@ def api_admin_clients():
         clients.append(item)
 
     clients.sort(key=lambda x: x.get("nombreCompleto", "").lower())
+    return jsonify({"ok": True, "clients": clients}), 200
+
+# =========================================================
+# ENDPOINTS HMI / WORKER
+# =========================================================
+@app.route("/api/worker/activate-by-folio/<folio>", methods=["POST"])
+def api_worker_activate_by_folio(folio):
+    folio = str(folio).strip().upper()
+    docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
+    if not docs:
+        return fail(f"No se encontró ningún pedido con ID {folio}", 404)
+
+    doc = docs[0]
+    doc_ref = fs.collection("pedidos").document(doc.id)
+    snap = doc_ref.get()
+    data = snap.to_dict() or {}
+
+    payload = {
+        "activado_hmi": True,
+        "hmi_activated_at": now_mx().isoformat(),
+        "updated_at": now_mx().isoformat()
+    }
+
+    if data.get("Estado", "pendiente") == "pendiente":
+        payload["rutina_activa"] = False
+
+    doc_ref.update(payload)
+    guardar_estado(
+        activo=True,
+        estado=f"Pedido activado por HMI: {folio}",
+        current_order_id=doc.id,
+        current_order_folio=folio
+    )
+
+    updated = doc_ref.get()
+    return jsonify({
+        "ok": True,
+        "message": f"Pedido activado correctamente: {folio}",
+        "order": order_doc_to_json(updated)
+    }), 200
+
+@app.route("/api/worker/active-order", methods=["GET"])
+def api_worker_active_order():
+    current_order_id = str(estado_memoria.get("current_order_id", "")).strip()
+    current_order_folio = str(estado_memoria.get("current_order_folio", "")).strip()
+
+    if not current_order_id:
+        return jsonify({"ok": True, "order": None}), 200
+
+    snap = fs.collection("pedidos").document(current_order_id).get()
+    if not snap.exists:
+        guardar_estado(current_order_id="", current_order_folio="")
+        return jsonify({"ok": True, "order": None}), 200
 
     return jsonify({
         "ok": True,
-        "clients": clients
+        "order": order_doc_to_json(snap),
+        "current_order_id": current_order_id,
+        "current_order_folio": current_order_folio
     }), 200
 
-# =========================================================
-# ENDPOINTS WORKER
-# =========================================================
 @app.route("/api/worker/next-order", methods=["GET"])
 def api_worker_next_order():
-    docs = fs.collection("pedidos").where("Estado", "==", "pendiente").stream()
+    docs = fs.collection("pedidos").where("Estado", "==", "pendiente").where("activado_hmi", "==", True).stream()
     items = []
 
     for doc in docs:
         item = order_doc_to_json(doc)
         created_at = item.get("created_at", "")
-
         if not was_created_after_backend_start(created_at):
-            print(
-                f"[WORKER] Ignorando pedido viejo: "
-                f"{item.get('Folio', '')} | created_at={created_at} | backend_start={BACKEND_START_TIME_ISO}"
-            )
             continue
-
-        if not item.get("activado_hmi", False):
-            print(
-                f"[WORKER] Pedido aún no activado desde HMI: "
-                f"{item.get('Folio', '')}"
-            )
-            continue
-
         items.append(item)
 
     items.sort(key=lambda x: x.get("Contador", 0))
-
     if not items:
         return jsonify({"ok": True, "order": None}), 200
 
-    print(
-        f"[WORKER] Entregando pedido nuevo: "
-        f"{items[0].get('Folio', '')} | created_at={items[0].get('created_at', '')}"
-    )
     return jsonify({"ok": True, "order": items[0]}), 200
-
-
-@app.route("/api/worker/activate-by-folio/<folio>", methods=["POST"])
-def api_worker_activate_by_folio(folio):
-    doc, folio_normalizado = get_order_doc_by_folio(folio)
-
-    if not doc:
-        return fail(f"Pedido no encontrado para el folio {folio_normalizado or folio}", 404)
-
-    doc_ref = fs.collection("pedidos").document(doc.id)
-    snap = doc_ref.get()
-    data = snap.to_dict() or {}
-
-    ahora = now_mx().isoformat()
-    payload = {
-        "activado_hmi": True,
-        "hmi_activated_at": ahora,
-        "updated_at": ahora
-    }
-
-    if not data.get("Estado"):
-        payload["Estado"] = "pendiente"
-
-    doc_ref.update(payload)
-
-    updated = doc_ref.get()
-    return jsonify({
-        "ok": True,
-        "message": f"Pedido activado en HMI: {folio_normalizado}",
-        "order": order_doc_to_json(updated)
-    }), 200
-
 
 @app.route("/api/worker/orders/<order_id>/start", methods=["POST"])
 def api_worker_order_start(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
     snap = doc_ref.get()
-
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
     doc_ref.update({
         "Estado": "en_proceso",
         "rutina_activa": True,
-        "activado_hmi": True,
         "started_at": now_mx().isoformat(),
         "updated_at": now_mx().isoformat()
     })
 
-    return jsonify({
-        "ok": True,
-        "message": "Pedido iniciado"
-    }), 200
-
+    snap2 = doc_ref.get()
+    order = order_doc_to_json(snap2)
+    guardar_estado(activo=True, estado=f"Pedido iniciado: {order.get('Folio', '')}", current_order_id=order_id, current_order_folio=order.get("Folio", ""))
+    return jsonify({"ok": True, "message": "Pedido iniciado"}), 200
 
 @app.route("/api/worker/orders/<order_id>/status", methods=["POST"])
 def api_worker_order_status(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
     snap = doc_ref.get()
-
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
     data = request.get_json(silent=True) or {}
     estado = str(data.get("Estado", data.get("estado", ""))).strip()
-
     estados_validos = {"pendiente", "en_proceso", "planchado", "listo", "entregado"}
 
     if not estado:
         return fail("Debes enviar el estado", 400)
-
     if estado not in estados_validos:
         return fail("Estado inválido", 400)
 
-    payload = {
-        "Estado": estado,
-        "updated_at": now_mx().isoformat()
-    }
+    payload = {"Estado": estado, "updated_at": now_mx().isoformat()}
 
     if estado == "en_proceso":
         payload["rutina_activa"] = True
-        payload["activado_hmi"] = True
         payload["started_at"] = now_mx().isoformat()
-
     if estado == "planchado":
         payload["rutina_activa"] = True
-
     if estado == "listo":
         payload["rutina_activa"] = False
         payload["completed_at"] = now_mx().isoformat()
-
     if estado == "entregado":
         payload["rutina_activa"] = False
         payload["Validado"] = True
-
     if estado in {"pendiente", "en_proceso", "planchado", "listo"}:
         payload["Validado"] = False
 
     doc_ref.update(payload)
+    snap2 = doc_ref.get()
+    order = order_doc_to_json(snap2)
 
-    return jsonify({
-        "ok": True,
-        "message": f"Estado actualizado a {estado}",
-        "order_id": order_id,
-        "Estado": estado
-    }), 200
+    if estado in {"listo", "entregado"}:
+        guardar_estado(
+            activo=(estado != "entregado"),
+            estado=f"Pedido {estado}: {order.get('Folio', '')}",
+            current_order_id="" if estado == "entregado" else order_id,
+            current_order_folio="" if estado == "entregado" else order.get("Folio", "")
+        )
+    else:
+        guardar_estado(
+            activo=True,
+            estado=f"Pedido {estado}: {order.get('Folio', '')}",
+            current_order_id=order_id,
+            current_order_folio=order.get("Folio", "")
+        )
 
+    return jsonify({"ok": True, "message": f"Estado actualizado a {estado}", "order_id": order_id, "Estado": estado}), 200
 
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
     ruta_local = ""
     try:
-        print(f"[PHOTO] Iniciando carga de foto para pedido: {order_id}")
-
         doc_ref = fs.collection("pedidos").document(order_id)
         snap = doc_ref.get()
-
         if not snap.exists:
             return fail("Pedido no encontrado", 404)
 
@@ -1366,7 +1132,6 @@ def api_worker_order_photo(order_id):
             return fail("No se recibió archivo", 400)
 
         archivo = request.files["foto"]
-
         if archivo.filename == "":
             return fail("Archivo vacío", 400)
 
@@ -1378,21 +1143,16 @@ def api_worker_order_photo(order_id):
         nombre_seguro = secure_filename(archivo.filename)
         nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
         ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
-
-        print("[PHOTO] Guardando temporal en:", ruta_local)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
             raise RuntimeError("No se pudo guardar el archivo temporal")
 
         tam = os.path.getsize(ruta_local)
-        print("[PHOTO] Tamaño archivo local:", tam)
-
         if tam == 0:
             raise RuntimeError("El archivo guardado quedó vacío")
 
         content_type = archivo.mimetype or "image/jpeg"
-
         bucket = storage.bucket()
         blob = bucket.blob(f"pedidos/{order_id}/{nombre_final}")
         blob.upload_from_filename(ruta_local, content_type=content_type)
@@ -1414,7 +1174,6 @@ def api_worker_order_photo(order_id):
         fotos = data.get("fotos", [])
         if not isinstance(fotos, list):
             fotos = []
-
         fotos.append(foto_info)
 
         doc_ref.update({
@@ -1423,38 +1182,24 @@ def api_worker_order_photo(order_id):
         })
 
         try:
-            fotos_ref.push({
-                "order_id": order_id,
-                **foto_info
-            })
-        except Exception as e:
-            print("[PHOTO] Aviso al guardar copia en RTDB:", e)
+            fotos_ref.push({"order_id": order_id, **foto_info})
+        except Exception:
+            pass
 
-        print("[PHOTO] Foto guardada correctamente en Storage para pedido:", order_id)
-
-        return jsonify({
-            "ok": True,
-            "message": "Foto agregada al pedido",
-            "foto": foto_info
-        }), 200
-
+        return jsonify({"ok": True, "message": "Foto agregada al pedido", "foto": foto_info}), 200
     except Exception as e:
-        print("[PHOTO] Error:", type(e).__name__, str(e))
         return fail(f"Error interno al guardar la foto: {type(e).__name__}: {e}", 500)
-
     finally:
         if ruta_local and os.path.exists(ruta_local):
             try:
                 os.remove(ruta_local)
-            except Exception as e:
-                print("[PHOTO] No se pudo borrar temporal:", e)
-
+            except Exception:
+                pass
 
 @app.route("/api/worker/orders/<order_id>/complete", methods=["POST"])
 def api_worker_order_complete(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
     snap = doc_ref.get()
-
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
@@ -1465,17 +1210,15 @@ def api_worker_order_complete(order_id):
         "updated_at": now_mx().isoformat()
     })
 
-    return jsonify({
-        "ok": True,
-        "message": "Pedido completado"
-    }), 200
-
+    snap2 = doc_ref.get()
+    order = order_doc_to_json(snap2)
+    guardar_estado(activo=False, estado=f"Pedido completado: {order.get('Folio', '')}", current_order_id=order_id, current_order_folio=order.get("Folio", ""))
+    return jsonify({"ok": True, "message": "Pedido completado"}), 200
 
 @app.route("/api/worker/orders/<order_id>/error", methods=["POST"])
 def api_worker_order_error(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
     snap = doc_ref.get()
-
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
@@ -1489,10 +1232,10 @@ def api_worker_order_error(order_id):
         "updated_at": now_mx().isoformat()
     })
 
-    return jsonify({
-        "ok": True,
-        "message": "Error registrado"
-    }), 200
+    snap2 = doc_ref.get()
+    order = order_doc_to_json(snap2)
+    guardar_estado(activo=False, estado=f"Error en pedido: {order.get('Folio', '')}", current_order_id=order_id, current_order_folio=order.get("Folio", ""))
+    return jsonify({"ok": True, "message": "Error registrado"}), 200
 
 # =========================================================
 # ENDPOINTS LEGACY
@@ -1505,23 +1248,15 @@ def obtener_estado():
         "backend_start_time": BACKEND_START_TIME_ISO
     })
 
-
 @app.route("/set_usuario", methods=["POST"])
 def set_usuario():
     data = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
-
     if not usuario or not usuario.isdigit() or len(usuario) > 5:
         return fail("Usuario inválido, máximo 5 dígitos", 400)
 
     guardar_estado(usuario=usuario, estado=f"Usuario actual: {usuario}")
-
-    return jsonify({
-        "ok": True,
-        "message": f"Usuario {usuario} guardado correctamente",
-        "data": estado_memoria
-    }), 200
-
+    return jsonify({"ok": True, "message": f"Usuario {usuario} guardado correctamente", "data": estado_memoria}), 200
 
 @app.route("/set_cantidad", methods=["POST"])
 def set_cantidad():
@@ -1531,58 +1266,26 @@ def set_cantidad():
 
     if not usuario or not usuario.isdigit() or len(usuario) > 5:
         return fail("Usuario inválido", 400)
-
     if not isinstance(cantidad, int) or cantidad < 0:
         return fail("Cantidad inválida", 400)
 
-    guardar_estado(
-        usuario=usuario,
-        cantidad=cantidad,
-        activo=(cantidad > 0),
-        estado=f"Usuario {usuario}: cantidad actualizada a {cantidad}"
-    )
-
-    return jsonify({
-        "ok": True,
-        "message": "Cantidad actualizada correctamente",
-        "data": estado_memoria
-    }), 200
-
+    guardar_estado(usuario=usuario, cantidad=cantidad, activo=(cantidad > 0), estado=f"Usuario {usuario}: cantidad actualizada a {cantidad}")
+    return jsonify({"ok": True, "message": "Cantidad actualizada correctamente", "data": estado_memoria}), 200
 
 @app.route("/activar_plc", methods=["POST"])
 def activar_plc():
     data = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
-
     if not usuario:
         return fail("Debes enviar usuario", 400)
 
-    guardar_estado(
-        usuario=usuario,
-        activo=True,
-        estado=f"Motor continuo activo para usuario {usuario}"
-    )
-
-    return jsonify({
-        "ok": True,
-        "message": "PLC activado correctamente",
-        "data": estado_memoria
-    }), 200
-
+    guardar_estado(usuario=usuario, activo=True, estado=f"Motor continuo activo para usuario {usuario}")
+    return jsonify({"ok": True, "message": "PLC activado correctamente", "data": estado_memoria}), 200
 
 @app.route("/desactivar_plc", methods=["POST"])
 def desactivar_plc():
-    guardar_estado(
-        activo=False,
-        estado="PLC desactivado"
-    )
-
-    return jsonify({
-        "ok": True,
-        "message": "PLC desactivado correctamente",
-        "data": estado_memoria
-    }), 200
-
+    guardar_estado(activo=False, estado="PLC desactivado")
+    return jsonify({"ok": True, "message": "PLC desactivado correctamente", "data": estado_memoria}), 200
 
 @app.route("/subir_foto", methods=["POST"])
 def subir_foto():
@@ -1592,12 +1295,10 @@ def subir_foto():
             return fail("No se recibió archivo", 400)
 
         usuario = str(request.form.get("usuario", "")).strip()
-
         if not usuario.isdigit() or len(usuario) > 5:
             return fail("Usuario inválido", 400)
 
         archivo = request.files["foto"]
-
         if archivo.filename == "":
             return fail("Archivo vacío", 400)
 
@@ -1609,21 +1310,16 @@ def subir_foto():
         nombre_seguro = secure_filename(archivo.filename)
         nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
         ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
-
-        print("[SUBIR_FOTO] Guardando temporal en:", ruta_local)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
             raise RuntimeError("No se pudo guardar el archivo")
 
         tam = os.path.getsize(ruta_local)
-        print("[SUBIR_FOTO] Tamaño archivo local:", tam)
-
         if tam == 0:
             raise RuntimeError("El archivo guardado quedó vacío")
 
         content_type = archivo.mimetype or "image/jpeg"
-
         bucket = storage.bucket()
         blob = bucket.blob(f"usuarios/{usuario}/{nombre_final}")
         blob.upload_from_filename(ruta_local, content_type=content_type)
@@ -1643,48 +1339,26 @@ def subir_foto():
         }
 
         fotos_ref.push(foto_info)
-
-        print("[SUBIR_FOTO] Foto guardada correctamente para usuario:", usuario)
-
-        return jsonify({
-            "ok": True,
-            "message": "Foto subida correctamente",
-            "foto": foto_info
-        }), 200
-
+        return jsonify({"ok": True, "message": "Foto subida correctamente", "foto": foto_info}), 200
     except Exception as e:
-        print("[SUBIR_FOTO] Error:", type(e).__name__, str(e))
         return fail(f"Error interno al subir la foto: {type(e).__name__}: {e}", 500)
-
     finally:
         if ruta_local and os.path.exists(ruta_local):
             try:
                 os.remove(ruta_local)
-            except Exception as e:
-                print("[SUBIR_FOTO] No se pudo borrar temporal:", e)
-
+            except Exception:
+                pass
 
 @app.route("/fotos_usuario/<usuario>", methods=["GET"])
 def fotos_usuario(usuario):
     usuario = str(usuario).strip()
-
     if not usuario.isdigit() or len(usuario) > 5:
         return fail("Usuario inválido", 400)
 
     data = fotos_ref.get() or {}
-    items = []
-
-    for _, item in data.items():
-        if str(item.get("usuario", "")).strip() == usuario:
-            items.append(item)
-
+    items = [item for _, item in data.items() if str(item.get("usuario", "")).strip() == usuario]
     items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-
-    return jsonify({
-        "ok": True,
-        "fotos": items
-    }), 200
-
+    return jsonify({"ok": True, "fotos": items}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
