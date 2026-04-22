@@ -211,7 +211,9 @@ def order_doc_to_json(doc):
         "completed_at": data.get("completed_at", ""),
         "ultimo_error": data.get("ultimo_error", ""),
         "created_at": data.get("created_at", ""),
-        "updated_at": data.get("updated_at", "")
+        "updated_at": data.get("updated_at", ""),
+        "activado_hmi": data.get("activado_hmi", False),
+        "hmi_activated_at": data.get("hmi_activated_at", "")
     }
 
 
@@ -226,6 +228,26 @@ def auth_error_message(raw_message):
         "INVALID_LOGIN_CREDENTIALS": "Credenciales incorrectas."
     }
     return mapping.get(raw_message, raw_message)
+
+
+
+def normalize_folio(value):
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+    return raw if raw.startswith("#") else f"#{raw}"
+
+
+def get_order_doc_by_folio(folio):
+    folio = normalize_folio(folio)
+    if not folio:
+        return None, None
+
+    docs = list(fs.collection("pedidos").where("Folio", "==", folio).limit(1).stream())
+    if not docs:
+        return None, folio
+
+    return docs[0], folio
 
 
 # =========================================================
@@ -974,7 +996,9 @@ def api_create_order_client():
         "completed_at": "",
         "ultimo_error": "",
         "created_at": ahora,
-        "updated_at": ahora
+        "updated_at": ahora,
+        "activado_hmi": False,
+        "hmi_activated_at": ""
     }
 
     ref = fs.collection("pedidos").document()
@@ -1006,15 +1030,14 @@ def api_orders_my():
 
 @app.route("/api/orders/track/<folio>", methods=["GET"])
 def api_orders_track(folio):
-    folio = str(folio).strip().upper()
-    docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
+    doc, folio_normalizado = get_order_doc_by_folio(folio)
 
-    if not docs:
-        return fail(f"No se encontró ningún pedido con ID {folio}", 404)
+    if not doc:
+        return fail(f"No se encontró ningún pedido con ID {folio_normalizado or folio}", 404)
 
     return jsonify({
         "ok": True,
-        "order": order_doc_to_json(docs[0])
+        "order": order_doc_to_json(doc)
     }), 200
 
 # =========================================================
@@ -1087,7 +1110,9 @@ def api_admin_orders_create():
         "completed_at": "",
         "ultimo_error": "",
         "created_at": ahora,
-        "updated_at": ahora
+        "updated_at": ahora,
+        "activado_hmi": False,
+        "hmi_activated_at": ""
     }
 
     ref = fs.collection("pedidos").document()
@@ -1198,6 +1223,13 @@ def api_worker_next_order():
             )
             continue
 
+        if not item.get("activado_hmi", False):
+            print(
+                f"[WORKER] Pedido aún no activado desde HMI: "
+                f"{item.get('Folio', '')}"
+            )
+            continue
+
         items.append(item)
 
     items.sort(key=lambda x: x.get("Contador", 0))
@@ -1212,6 +1244,37 @@ def api_worker_next_order():
     return jsonify({"ok": True, "order": items[0]}), 200
 
 
+@app.route("/api/worker/activate-by-folio/<folio>", methods=["POST"])
+def api_worker_activate_by_folio(folio):
+    doc, folio_normalizado = get_order_doc_by_folio(folio)
+
+    if not doc:
+        return fail(f"Pedido no encontrado para el folio {folio_normalizado or folio}", 404)
+
+    doc_ref = fs.collection("pedidos").document(doc.id)
+    snap = doc_ref.get()
+    data = snap.to_dict() or {}
+
+    ahora = now_mx().isoformat()
+    payload = {
+        "activado_hmi": True,
+        "hmi_activated_at": ahora,
+        "updated_at": ahora
+    }
+
+    if not data.get("Estado"):
+        payload["Estado"] = "pendiente"
+
+    doc_ref.update(payload)
+
+    updated = doc_ref.get()
+    return jsonify({
+        "ok": True,
+        "message": f"Pedido activado en HMI: {folio_normalizado}",
+        "order": order_doc_to_json(updated)
+    }), 200
+
+
 @app.route("/api/worker/orders/<order_id>/start", methods=["POST"])
 def api_worker_order_start(order_id):
     doc_ref = fs.collection("pedidos").document(order_id)
@@ -1223,6 +1286,7 @@ def api_worker_order_start(order_id):
     doc_ref.update({
         "Estado": "en_proceso",
         "rutina_activa": True,
+        "activado_hmi": True,
         "started_at": now_mx().isoformat(),
         "updated_at": now_mx().isoformat()
     })
@@ -1259,6 +1323,7 @@ def api_worker_order_status(order_id):
 
     if estado == "en_proceso":
         payload["rutina_activa"] = True
+        payload["activado_hmi"] = True
         payload["started_at"] = now_mx().isoformat()
 
     if estado == "planchado":
