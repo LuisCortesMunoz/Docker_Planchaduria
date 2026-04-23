@@ -1,9 +1,7 @@
 # ================================
-# app.py
-# Backend corregido:
-# - El pedido se crea con QR por folio
-# - La HMI SOLO activa el pedido por folio
-# - La foto real la debe subir la Raspberry al endpoint /api/worker/orders/<order_id>/photo
+# app.py — BACKEND (Render)
+# CAMBIO: Agregado estado "listo_para_entrega"
+# Modificaciones marcadas con # ✅ NUEVO
 # ================================
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -197,6 +195,7 @@ def order_doc_to_json(doc):
         "hmi_activated_at": data.get("hmi_activated_at", ""),
         "started_at": data.get("started_at", ""),
         "completed_at": data.get("completed_at", ""),
+        "planchado_completado_at": data.get("planchado_completado_at", ""),  # ✅ NUEVO
         "ultimo_error": data.get("ultimo_error", ""),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", "")
@@ -821,6 +820,7 @@ def api_create_order_client():
         "hmi_activated_at": "",
         "started_at": "",
         "completed_at": "",
+        "planchado_completado_at": "",  # ✅ NUEVO
         "ultimo_error": "",
         "created_at": ahora,
         "updated_at": ahora
@@ -908,6 +908,7 @@ def api_admin_orders_create():
         "hmi_activated_at": "",
         "started_at": "",
         "completed_at": "",
+        "planchado_completado_at": "",  # ✅ NUEVO
         "ultimo_error": "",
         "created_at": ahora,
         "updated_at": ahora
@@ -1074,7 +1075,9 @@ def api_worker_order_status(order_id):
 
     data = request.get_json(silent=True) or {}
     estado = str(data.get("Estado", data.get("estado", ""))).strip()
-    estados_validos = {"pendiente", "en_proceso", "planchado", "listo", "entregado"}
+
+    # ✅ NUEVO: "listo_para_entrega" agregado a los estados válidos
+    estados_validos = {"pendiente", "en_proceso", "planchado", "listo_para_entrega", "listo", "entregado"}
 
     if not estado:
         return fail("Debes enviar el estado", 400)
@@ -1088,25 +1091,38 @@ def api_worker_order_status(order_id):
         payload["started_at"] = now_mx().isoformat()
     if estado == "planchado":
         payload["rutina_activa"] = True
+    # ✅ NUEVO: listo_para_entrega = planchado físicamente terminado, en espera de confirmación final
+    if estado == "listo_para_entrega":
+        payload["rutina_activa"] = False
+        payload["planchado_completado_at"] = now_mx().isoformat()
     if estado == "listo":
         payload["rutina_activa"] = False
         payload["completed_at"] = now_mx().isoformat()
     if estado == "entregado":
         payload["rutina_activa"] = False
         payload["Validado"] = True
-    if estado in {"pendiente", "en_proceso", "planchado", "listo"}:
+    # ✅ NUEVO: listo_para_entrega no es entregado, así que Validado = False
+    if estado in {"pendiente", "en_proceso", "planchado", "listo_para_entrega", "listo"}:
         payload["Validado"] = False
 
     doc_ref.update(payload)
     snap2 = doc_ref.get()
     order = order_doc_to_json(snap2)
 
-    if estado in {"listo", "entregado"}:
+    # ✅ NUEVO: listo_para_entrega mantiene el pedido activo en memoria (aún no terminó el flujo completo)
+    if estado == "entregado":
         guardar_estado(
-            activo=(estado != "entregado"),
+            activo=False,
+            estado=f"Pedido entregado: {order.get('Folio', '')}",
+            current_order_id="",
+            current_order_folio=""
+        )
+    elif estado in {"listo_para_entrega", "listo"}:
+        guardar_estado(
+            activo=True,
             estado=f"Pedido {estado}: {order.get('Folio', '')}",
-            current_order_id="" if estado == "entregado" else order_id,
-            current_order_folio="" if estado == "entregado" else order.get("Folio", "")
+            current_order_id=order_id,
+            current_order_folio=order.get("Folio", "")
         )
     else:
         guardar_estado(
