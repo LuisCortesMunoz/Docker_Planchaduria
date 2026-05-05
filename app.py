@@ -3,7 +3,7 @@
 # CAMBIO: Agregado estado "listo_para_entrega"
 # CAMBIO: Migrado envío de correo de smtplib → Resend API (HTTP/443)
 #         Render bloquea todos los puertos SMTP; Resend usa HTTPS.
-# Cambios marcados con # ✅ RESEND
+# Cambios marcados con # ✅ BREVO
 # ================================
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -13,7 +13,7 @@ from firebase_admin import credentials, firestore, db, auth as firebase_auth, st
 import os
 import requests
 import random
-import resend                       # ✅ RESEND  (pip install resend)
+# ✅ BREVO — usa requests (ya incluido), sin dependencia extra
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
@@ -36,11 +36,9 @@ FIREBASE_WEB_API_KEY    = os.environ.get("FIREBASE_WEB_API_KEY",    "")
 FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "TU_BUCKET_REAL.firebasestorage.app")
 ADMIN_UID               = os.environ.get("ADMIN_UID",               "")
 
-# ✅ RESEND — solo necesitas RESEND_API_KEY y SMTP_FROM (remitente)
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
-SMTP_FROM      = os.environ.get("SMTP_FROM",      "").strip()   # ej: onboarding@resend.dev
-
-resend.api_key = RESEND_API_KEY     # ✅ RESEND — inicializar SDK
+# ✅ BREVO — solo necesitas BREVO_API_KEY y SMTP_FROM (remitente verificado en Brevo)
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
+SMTP_FROM     = os.environ.get("SMTP_FROM",     "").strip()   # ej: tu correo verificado en Brevo
 
 REGISTER_CODE_MINUTES = 10
 REGISTER_MAX_ATTEMPTS = 5
@@ -50,8 +48,8 @@ RESET_MAX_ATTEMPTS    = 5
 print("[CONFIG] FIREBASE_CRED_FILE:",      FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:",         FIREBASE_DB_URL)
 print("[CONFIG] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
-print("[CONFIG] RESEND_API_KEY set:",      bool(RESEND_API_KEY))  # ✅ RESEND
-print("[CONFIG] SMTP_FROM:",               SMTP_FROM)             # ✅ RESEND
+print("[CONFIG] BREVO_API_KEY set:",       bool(BREVO_API_KEY))  # ✅ BREVO
+print("[CONFIG] SMTP_FROM:",               SMTP_FROM)             # ✅ BREVO
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -254,47 +252,63 @@ def get_firebase_user_by_email(email):
     return firebase_auth.get_user_by_email(normalize_email(email))
 
 # =========================================================
-# ✅ RESEND — envío de correo por HTTPS (sin SMTP, sin puertos bloqueados)
 # =========================================================
+# ✅ BREVO — envío de correo por HTTPS (sin SMTP, sin puertos bloqueados)
 class EmailConfigError(Exception):
-    """Falta RESEND_API_KEY o SMTP_FROM en las variables de entorno."""
+    """Falta BREVO_API_KEY o SMTP_FROM en las variables de entorno."""
     pass
 
 class EmailSendError(Exception):
-    """Error al enviar el correo a través de Resend."""
+    """Error al enviar el correo a través de Brevo."""
     pass
 
 
 def send_email(to_email, subject, html_body, text_body=""):
     """
-    Envía un correo usando la API HTTP de Resend.
+    Envía un correo usando la API HTTP de Brevo (antes Sendinblue).
     No usa SMTP — usa HTTPS (puerto 443, siempre abierto en Render).
+    Gratis hasta 300 emails/día, sin necesidad de dominio propio.
     Lanza EmailConfigError o EmailSendError con mensajes descriptivos.
     """
-    if not RESEND_API_KEY:
+    if not BREVO_API_KEY:
         raise EmailConfigError(
-            "Falta RESEND_API_KEY en las variables de entorno de Render"
+            "Falta BREVO_API_KEY en las variables de entorno de Render"
         )
     if not SMTP_FROM:
         raise EmailConfigError(
-            "Falta SMTP_FROM (dirección remitente) en las variables de entorno de Render"
+            "Falta SMTP_FROM (dirección remitente verificada en Brevo) en las variables de entorno"
         )
 
-    params = {
-        "from":    SMTP_FROM,
-        "to":      [to_email],
-        "subject": subject,
-        "html":    html_body,
+    url     = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept":       "application/json",
+        "content-type": "application/json",
+        "api-key":      BREVO_API_KEY
+    }
+    payload = {
+        "sender":      {"email": SMTP_FROM},
+        "to":          [{"email": to_email}],
+        "subject":     subject,
+        "htmlContent": html_body,
     }
     if text_body:
-        params["text"] = text_body
+        payload["textContent"] = text_body
 
     try:
-        resend.Emails.send(params)
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code not in (200, 201):
+            error_detail = resp.json() if resp.content else resp.status_code
+            raise EmailSendError(
+                f"Brevo respondió con error {resp.status_code}: {error_detail}"
+            )
+    except EmailSendError:
+        raise
+    except requests.exceptions.Timeout:
+        raise EmailSendError("Timeout al conectar con la API de Brevo")
+    except requests.exceptions.ConnectionError as e:
+        raise EmailSendError(f"Error de red al conectar con Brevo: {e}")
     except Exception as e:
-        raise EmailSendError(
-            f"Resend no pudo enviar el correo: {type(e).__name__}: {e}"
-        )
+        raise EmailSendError(f"Error inesperado al enviar con Brevo: {type(e).__name__}: {e}")
 
 
 def send_register_code_email(to_email, nombre, code):
@@ -422,7 +436,7 @@ def home():
 
 # =========================================================
 # AUTH REGISTRO CON CÓDIGO
-# ✅ RESEND — errores capturados con EmailConfigError / EmailSendError
+# ✅ BREVO — errores capturados con EmailConfigError / EmailSendError
 # =========================================================
 @app.route("/api/auth/request-register-code", methods=["POST"])
 def api_request_register_code():
