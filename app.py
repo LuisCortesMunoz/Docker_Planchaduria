@@ -291,6 +291,8 @@ class SmtpSendError(Exception):
 def _send_email_smtp_blocking(to_email, subject, html_body, text_body=""):
     """
     Función bloqueante real. Se llama desde un hilo separado.
+    - SMTP_USE_TLS=true  → puerto 587, STARTTLS
+    - SMTP_USE_TLS=false → puerto 465, SSL directo (SMTP_SSL)
     Lanza SmtpConfigError o SmtpSendError con mensajes descriptivos.
     """
     missing = [
@@ -317,14 +319,20 @@ def _send_email_smtp_blocking(to_email, subject, html_body, text_body=""):
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        # Timeout de 20 s: suficiente para STARTTLS y login en la mayoría de proveedores
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.ehlo()
-            if SMTP_USE_TLS:
+        if SMTP_USE_TLS:
+            # ── Puerto 587: conexión normal + STARTTLS ──────────────────────
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.ehlo()
                 server.starttls()
                 server.ehlo()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+        else:
+            # ── Puerto 465: SSL directo desde el inicio ─────────────────────
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(SMTP_FROM, [to_email], msg.as_string())
 
     except smtplib.SMTPAuthenticationError:
         raise SmtpSendError(
@@ -1581,6 +1589,28 @@ def fotos_usuario(usuario):
     items = [item for _, item in data.items() if str(item.get("usuario", "")).strip() == usuario]
     items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return jsonify({"ok": True, "fotos": items}), 200
+
+# =========================================================
+# DEBUG — verificar puertos SMTP desde Render
+# ⚠️  ELIMINAR ESTE ENDPOINT ANTES DE PASAR A PRODUCCIÓN DEFINITIVA
+# =========================================================
+@app.route("/debug/smtp-test", methods=["GET"])
+def debug_smtp_test():
+    results = {}
+    for port in [25, 465, 587, 2525]:
+        try:
+            sock = socket.create_connection((SMTP_HOST, port), timeout=5)
+            sock.close()
+            results[str(port)] = "ABIERTO ✅"
+        except Exception as e:
+            results[str(port)] = f"BLOQUEADO ❌ ({e})"
+    return jsonify({
+        "host": SMTP_HOST,
+        "smtp_use_tls": SMTP_USE_TLS,
+        "smtp_port_configured": SMTP_PORT,
+        "ports": results
+    })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
