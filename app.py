@@ -1,7 +1,8 @@
 # ================================
 # app.py — BACKEND (Render)
 # CAMBIO: Agregado estado "listo_para_entrega"
-# Modificaciones marcadas con # ✅ NUEVO
+# CAMBIO: Correcciones SMTP (threading, errores descriptivos, variables robustas)
+# Modificaciones SMTP marcadas con # ✅ SMTP FIX
 # ================================
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -12,6 +13,8 @@ import os
 import requests
 import random
 import smtplib
+import socket           # ✅ SMTP FIX
+import threading        # ✅ SMTP FIX
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -36,12 +39,19 @@ FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
 FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "TU_BUCKET_REAL.firebasestorage.app")
 ADMIN_UID = os.environ.get("ADMIN_UID", "")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "").strip()
-SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER).strip()
+# ✅ SMTP FIX — .strip() en todas las variables + conversión segura de puerto
+SMTP_HOST    = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT_RAW = os.environ.get("SMTP_PORT", "587").strip()
+SMTP_USER    = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS    = os.environ.get("SMTP_PASS", "").strip()
+SMTP_FROM    = os.environ.get("SMTP_FROM", "").strip() or os.environ.get("SMTP_USER", "").strip()
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() == "true"
+
+try:                            # ✅ SMTP FIX — conversión segura del puerto
+    SMTP_PORT = int(SMTP_PORT_RAW)
+except ValueError:
+    SMTP_PORT = 587
+    print(f"[CONFIG] SMTP_PORT inválido ('{SMTP_PORT_RAW}'), usando 587 por defecto")
 
 REGISTER_CODE_MINUTES = 10
 REGISTER_MAX_ATTEMPTS = 5
@@ -51,6 +61,11 @@ RESET_MAX_ATTEMPTS = 5
 print("[CONFIG] FIREBASE_CRED_FILE:", FIREBASE_CRED_FILE)
 print("[CONFIG] FIREBASE_DB_URL:", FIREBASE_DB_URL)
 print("[CONFIG] FIREBASE_STORAGE_BUCKET:", FIREBASE_STORAGE_BUCKET)
+print("[CONFIG] SMTP_HOST:", SMTP_HOST)          # ✅ SMTP FIX
+print("[CONFIG] SMTP_PORT:", SMTP_PORT)           # ✅ SMTP FIX
+print("[CONFIG] SMTP_USER:", SMTP_USER)           # ✅ SMTP FIX
+print("[CONFIG] SMTP_FROM:", SMTP_FROM)           # ✅ SMTP FIX
+print("[CONFIG] SMTP_USE_TLS:", SMTP_USE_TLS)    # ✅ SMTP FIX
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED_FILE)
@@ -61,9 +76,9 @@ if not firebase_admin._apps:
 
 fs = firestore.client()
 
-estado_ref = db.reference("estado_actual")
+estado_ref   = db.reference("estado_actual")
 historial_ref = db.reference("historial")
-fotos_ref = db.reference("fotos")
+fotos_ref    = db.reference("fotos")
 
 estado_memoria = {
     "usuario_actual": "",
@@ -78,7 +93,7 @@ estado_memoria = {
 # =========================================================
 # HORA DE ARRANQUE DEL BACKEND
 # =========================================================
-BACKEND_START_TIME = datetime.now(ZoneInfo("America/Mexico_City"))
+BACKEND_START_TIME     = datetime.now(ZoneInfo("America/Mexico_City"))
 BACKEND_START_TIME_ISO = BACKEND_START_TIME.isoformat()
 
 # =========================================================
@@ -123,8 +138,8 @@ def require_auth(admin=False):
             except Exception:
                 return fail("Token inválido o expirado", 401)
 
-            request.user = decoded
-            request.user_uid = decoded.get("uid")
+            request.user          = decoded
+            request.user_uid      = decoded.get("uid")
             request.user_is_admin = is_admin_uid(request.user_uid)
 
             if admin and not request.user_is_admin:
@@ -195,7 +210,7 @@ def order_doc_to_json(doc):
         "hmi_activated_at": data.get("hmi_activated_at", ""),
         "started_at": data.get("started_at", ""),
         "completed_at": data.get("completed_at", ""),
-        "planchado_completado_at": data.get("planchado_completado_at", ""),  # ✅ NUEVO
+        "planchado_completado_at": data.get("planchado_completado_at", ""),
         "ultimo_error": data.get("ultimo_error", ""),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", "")
@@ -203,13 +218,13 @@ def order_doc_to_json(doc):
 
 def auth_error_message(raw_message):
     mapping = {
-        "EMAIL_EXISTS": "Este correo ya está registrado.",
-        "OPERATION_NOT_ALLOWED": "Operación no permitida.",
-        "TOO_MANY_ATTEMPTS_TRY_LATER": "Demasiados intentos. Intenta más tarde.",
-        "EMAIL_NOT_FOUND": "Correo no registrado.",
-        "INVALID_PASSWORD": "Contraseña incorrecta.",
-        "USER_DISABLED": "Usuario deshabilitado.",
-        "INVALID_LOGIN_CREDENTIALS": "Credenciales incorrectas."
+        "EMAIL_EXISTS":                  "Este correo ya está registrado.",
+        "OPERATION_NOT_ALLOWED":         "Operación no permitida.",
+        "TOO_MANY_ATTEMPTS_TRY_LATER":   "Demasiados intentos. Intenta más tarde.",
+        "EMAIL_NOT_FOUND":               "Correo no registrado.",
+        "INVALID_PASSWORD":              "Contraseña incorrecta.",
+        "USER_DISABLED":                 "Usuario deshabilitado.",
+        "INVALID_LOGIN_CREDENTIALS":     "Credenciales incorrectas."
     }
     return mapping.get(raw_message, raw_message)
 
@@ -260,28 +275,116 @@ def get_firebase_user_by_email(email):
     email = normalize_email(email)
     return firebase_auth.get_user_by_email(email)
 
-def send_email_smtp(to_email, subject, html_body, text_body=""):
-    if not SMTP_HOST or not SMTP_PORT or not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
-        raise RuntimeError("Faltan variables SMTP en Environment")
+# =========================================================
+# SMTP — Excepciones propias + envío en hilo separado
+# ✅ SMTP FIX
+# =========================================================
+class SmtpConfigError(Exception):
+    """Variables SMTP faltantes o inválidas en el entorno."""
+    pass
+
+class SmtpSendError(Exception):
+    """Error durante la conexión o el envío SMTP."""
+    pass
+
+
+def _send_email_smtp_blocking(to_email, subject, html_body, text_body=""):
+    """
+    Función bloqueante real. Se llama desde un hilo separado.
+    Lanza SmtpConfigError o SmtpSendError con mensajes descriptivos.
+    """
+    missing = [
+        name for name, val in [
+            ("SMTP_HOST", SMTP_HOST),
+            ("SMTP_PORT", SMTP_PORT),
+            ("SMTP_USER", SMTP_USER),
+            ("SMTP_PASS", SMTP_PASS),
+            ("SMTP_FROM", SMTP_FROM),
+        ] if not val
+    ]
+    if missing:
+        raise SmtpConfigError(
+            f"Variables SMTP faltantes en el entorno: {', '.join(missing)}"
+        )
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
+    msg["From"]    = SMTP_FROM
+    msg["To"]      = to_email
 
     if text_body:
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
-
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.ehlo()
-        if SMTP_USE_TLS:
-            server.starttls()
+    try:
+        # Timeout de 20 s: suficiente para STARTTLS y login en la mayoría de proveedores
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
             server.ehlo()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+            if SMTP_USE_TLS:
+                server.starttls()
+                server.ehlo()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
 
+    except smtplib.SMTPAuthenticationError:
+        raise SmtpSendError(
+            "Credenciales SMTP incorrectas (verifica SMTP_USER y SMTP_PASS)"
+        )
+    except smtplib.SMTPConnectError:
+        raise SmtpSendError(
+            f"No se pudo conectar al servidor SMTP ({SMTP_HOST}:{SMTP_PORT})"
+        )
+    except smtplib.SMTPRecipientsRefused:
+        raise SmtpSendError(
+            f"El destinatario fue rechazado por el servidor: {to_email}"
+        )
+    except smtplib.SMTPException as e:
+        raise SmtpSendError(f"Error SMTP: {e}")
+    except socket.timeout:
+        raise SmtpSendError(
+            f"Timeout al conectar con el servidor SMTP ({SMTP_HOST}:{SMTP_PORT})"
+        )
+    except OSError as e:
+        raise SmtpSendError(f"Error de red al conectar con SMTP: {e}")
+
+
+def send_email_smtp(to_email, subject, html_body, text_body=""):
+    """
+    Envía el correo en un hilo separado con un timeout total de 25 s.
+    De esta forma Flask siempre responde antes de que Render corte la
+    conexión HTTP (~30 s), evitando el 'Failed to fetch' en el frontend.
+    Lanza SmtpConfigError o SmtpSendError si algo falla.
+    """
+    result = {"error": None}
+
+    def worker():
+        try:
+            _send_email_smtp_blocking(to_email, subject, html_body, text_body)
+        except (SmtpConfigError, SmtpSendError) as e:
+            result["error"] = e
+        except Exception as e:
+            result["error"] = SmtpSendError(
+                f"Error inesperado al enviar correo: {type(e).__name__}: {e}"
+            )
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    # Esperar máximo 25 s — Render suele cortar conexiones HTTP a los ~30 s
+    thread.join(timeout=25)
+
+    if thread.is_alive():
+        # El servidor SMTP tardó demasiado; respondemos al cliente de todas formas
+        raise SmtpSendError(
+            "El servidor de correo tardó demasiado en responder. "
+            "El mensaje puede llegar con retraso — revisa tu bandeja en unos minutos."
+        )
+
+    if result["error"]:
+        raise result["error"]
+
+# =========================================================
+# EMAIL — funciones de contenido (sin cambios de lógica)
+# =========================================================
 def send_register_code_email(to_email, nombre, code):
     display_name = str(nombre or "").strip() or "usuario"
     subject = "Código de verificación - Planchado Express"
@@ -358,7 +461,8 @@ def generate_folio():
 # =========================================================
 # ESTADO MEMORIA
 # =========================================================
-def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None, current_order_id=None, current_order_folio=None):
+def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None,
+                   current_order_id=None, current_order_folio=None):
     global estado_memoria
 
     if usuario is not None:
@@ -378,13 +482,13 @@ def guardar_estado(usuario=None, cantidad=None, activo=None, estado=None, curren
 
     estado_ref.set(estado_memoria)
     historial_ref.push({
-        "usuario_actual": estado_memoria["usuario_actual"],
-        "cantidad": estado_memoria["cantidad"],
-        "activo": estado_memoria["activo"],
-        "estado": estado_memoria["estado"],
-        "current_order_id": estado_memoria["current_order_id"],
+        "usuario_actual":    estado_memoria["usuario_actual"],
+        "cantidad":          estado_memoria["cantidad"],
+        "activo":            estado_memoria["activo"],
+        "estado":            estado_memoria["estado"],
+        "current_order_id":  estado_memoria["current_order_id"],
         "current_order_folio": estado_memoria["current_order_folio"],
-        "timestamp": estado_memoria["updated_at"]
+        "timestamp":         estado_memoria["updated_at"]
     })
 
 def cargar_estado():
@@ -411,13 +515,14 @@ def home():
 
 # =========================================================
 # AUTH REGISTRO CON CÓDIGO
+# ✅ SMTP FIX — try/except diferenciado para SmtpConfigError / SmtpSendError
 # =========================================================
 @app.route("/api/auth/request-register-code", methods=["POST"])
 def api_request_register_code():
     data = request.get_json(silent=True) or {}
-    nombre = str(data.get("nombre", "")).strip()
+    nombre   = str(data.get("nombre", "")).strip()
     apellido = str(data.get("apellido", "")).strip()
-    email = normalize_email(data.get("email", ""))
+    email    = normalize_email(data.get("email", ""))
     telefono = str(data.get("telefono", "")).strip()
     password = str(data.get("password", "")).strip()
 
@@ -431,33 +536,52 @@ def api_request_register_code():
             return fail("Este correo ya está registrado.", 400)
 
         code = generate_six_digit_code()
-        now = now_mx()
+        now  = now_mx()
         expires_at = now + timedelta(minutes=REGISTER_CODE_MINUTES)
 
         registration_doc_ref(email).set({
-            "nombre": nombre,
-            "apellido": apellido,
-            "email": email,
-            "telefono": telefono,
-            "password": password,
-            "code": code,
-            "attempts": 0,
-            "verified": False,
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "nombre":         nombre,
+            "apellido":       apellido,
+            "email":          email,
+            "telefono":       telefono,
+            "password":       password,
+            "code":           code,
+            "attempts":       0,
+            "verified":       False,
+            "created_at":     now.isoformat(),
+            "updated_at":     now.isoformat(),
             "code_expires_at": expires_at.isoformat()
         })
 
-        send_register_code_email(email, nombre, code)
-        return jsonify({"ok": True, "message": "Te enviamos un código de verificación a tu correo.", "email": email}), 200
+        # ✅ SMTP FIX — errores SMTP capturados por separado
+        try:
+            send_register_code_email(email, nombre, code)
+        except SmtpConfigError as e:
+            print(f"[SMTP CONFIG ERROR] {e}")
+            return fail(
+                "Error de configuración del servidor de correo. "
+                "Contacta al administrador.",
+                500
+            )
+        except SmtpSendError as e:
+            print(f"[SMTP SEND ERROR] {e}")
+            return fail(f"Error al enviar el correo de verificación: {e}", 502)
+
+        return jsonify({
+            "ok": True,
+            "message": "Te enviamos un código de verificación a tu correo.",
+            "email": email
+        }), 200
+
     except Exception as e:
-        return fail(f"No se pudo enviar el código: {e}", 500)
+        print(f"[ERROR] api_request_register_code: {e}")
+        return fail(f"Error interno del servidor: {e}", 500)
 
 @app.route("/api/auth/verify-register-code", methods=["POST"])
 def api_verify_register_code():
     data = request.get_json(silent=True) or {}
     email = normalize_email(data.get("email", ""))
-    code = str(data.get("code", "")).strip()
+    code  = str(data.get("code", "")).strip()
 
     if not email or not code:
         return fail("Debes enviar correo y código", 400)
@@ -488,7 +612,7 @@ def api_verify_register_code():
             doc_ref.delete()
             return fail("Este correo ya está registrado.", 400)
 
-        nombre = str(reg.get("nombre", "")).strip()
+        nombre   = str(reg.get("nombre", "")).strip()
         apellido = str(reg.get("apellido", "")).strip()
         telefono = str(reg.get("telefono", "")).strip()
         password = str(reg.get("password", "")).strip()
@@ -497,32 +621,38 @@ def api_verify_register_code():
         uid = created_user.uid
 
         fs.collection("usuarios").document(uid).set({
-            "nombre": nombre,
-            "apellido": apellido,
-            "email": email,
-            "telefono": telefono,
+            "nombre":     nombre,
+            "apellido":   apellido,
+            "email":      email,
+            "telefono":   telefono,
             "created_at": now_mx().isoformat()
         })
 
         auth_data = firebase_sign_in(email, password)
         user = {
-            "uid": uid,
-            "nombre": nombre,
-            "apellido": apellido,
+            "uid":           uid,
+            "nombre":        nombre,
+            "apellido":      apellido,
             "nombreCompleto": f"{nombre} {apellido}".strip(),
-            "email": email,
-            "telefono": telefono,
-            "isAdmin": is_admin_uid(uid)
+            "email":         email,
+            "telefono":      telefono,
+            "isAdmin":       is_admin_uid(uid)
         }
 
         doc_ref.delete()
-        return jsonify({"ok": True, "message": "Cuenta creada correctamente.", "token": auth_data.get("idToken"), "refreshToken": auth_data.get("refreshToken"), "user": user}), 200
+        return jsonify({
+            "ok": True,
+            "message": "Cuenta creada correctamente.",
+            "token": auth_data.get("idToken"),
+            "refreshToken": auth_data.get("refreshToken"),
+            "user": user
+        }), 200
     except Exception as e:
         return fail(f"No se pudo verificar el código: {e}", 500)
 
 @app.route("/api/auth/resend-register-code", methods=["POST"])
 def api_resend_register_code():
-    data = request.get_json(silent=True) or {}
+    data  = request.get_json(silent=True) or {}
     email = normalize_email(data.get("email", ""))
 
     if not email:
@@ -540,18 +670,31 @@ def api_resend_register_code():
             return fail("Este correo ya está registrado.", 400)
 
         code = generate_six_digit_code()
-        now = now_mx()
+        now  = now_mx()
         expires_at = now + timedelta(minutes=REGISTER_CODE_MINUTES)
 
         doc_ref.update({
-            "code": code,
-            "attempts": 0,
-            "verified": False,
-            "updated_at": now.isoformat(),
+            "code":           code,
+            "attempts":       0,
+            "verified":       False,
+            "updated_at":     now.isoformat(),
             "code_expires_at": expires_at.isoformat()
         })
 
-        send_register_code_email(email, reg.get("nombre", ""), code)
+        # ✅ SMTP FIX
+        try:
+            send_register_code_email(email, reg.get("nombre", ""), code)
+        except SmtpConfigError as e:
+            print(f"[SMTP CONFIG ERROR] {e}")
+            return fail(
+                "Error de configuración del servidor de correo. "
+                "Contacta al administrador.",
+                500
+            )
+        except SmtpSendError as e:
+            print(f"[SMTP SEND ERROR] {e}")
+            return fail(f"Error al reenviar el correo de verificación: {e}", 502)
+
         return jsonify({"ok": True, "message": "Te enviamos un nuevo código de verificación."}), 200
     except Exception as e:
         return fail(f"No se pudo reenviar el código: {e}", 500)
@@ -562,10 +705,11 @@ def api_register():
 
 # =========================================================
 # AUTH RECUPERAR CONTRASEÑA
+# ✅ SMTP FIX — try/except diferenciado para SmtpConfigError / SmtpSendError
 # =========================================================
 @app.route("/api/auth/request-reset-code", methods=["POST"])
 def api_request_reset_code():
-    data = request.get_json(silent=True) or {}
+    data  = request.get_json(silent=True) or {}
     email = normalize_email(data.get("email", ""))
 
     if not email:
@@ -574,32 +718,51 @@ def api_request_reset_code():
     try:
         user = get_firebase_user_by_email(email)
         code = generate_six_digit_code()
-        now = now_mx()
+        now  = now_mx()
         expires_at = now + timedelta(minutes=RESET_CODE_MINUTES)
 
         reset_doc_ref(email).set({
-            "email": email,
-            "uid": user.uid,
-            "code": code,
-            "attempts": 0,
-            "verified": False,
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "email":          email,
+            "uid":            user.uid,
+            "code":           code,
+            "attempts":       0,
+            "verified":       False,
+            "created_at":     now.isoformat(),
+            "updated_at":     now.isoformat(),
             "code_expires_at": expires_at.isoformat()
         })
 
-        send_reset_code_email(email, code)
-        return jsonify({"ok": True, "message": "Te enviamos un código para recuperar tu contraseña.", "email": email}), 200
+        # ✅ SMTP FIX
+        try:
+            send_reset_code_email(email, code)
+        except SmtpConfigError as e:
+            print(f"[SMTP CONFIG ERROR] {e}")
+            return fail(
+                "Error de configuración del servidor de correo. "
+                "Contacta al administrador.",
+                500
+            )
+        except SmtpSendError as e:
+            print(f"[SMTP SEND ERROR] {e}")
+            return fail(f"Error al enviar el correo de recuperación: {e}", 502)
+
+        return jsonify({
+            "ok": True,
+            "message": "Te enviamos un código para recuperar tu contraseña.",
+            "email": email
+        }), 200
+
     except firebase_auth.UserNotFoundError:
         return fail("Correo no registrado.", 404)
     except Exception as e:
-        return fail(f"No se pudo enviar el código de recuperación: {e}", 500)
+        print(f"[ERROR] api_request_reset_code: {e}")
+        return fail(f"Error interno del servidor: {e}", 500)
 
 @app.route("/api/auth/verify-reset-code", methods=["POST"])
 def api_verify_reset_code():
-    data = request.get_json(silent=True) or {}
+    data  = request.get_json(silent=True) or {}
     email = normalize_email(data.get("email", ""))
-    code = str(data.get("code", "")).strip()
+    code  = str(data.get("code", "")).strip()
 
     if not email or not code:
         return fail("Debes enviar correo y código", 400)
@@ -630,9 +793,9 @@ def api_verify_reset_code():
 
 @app.route("/api/auth/confirm-reset-password", methods=["POST"])
 def api_confirm_reset_password():
-    data = request.get_json(silent=True) or {}
-    email = normalize_email(data.get("email", ""))
-    code = str(data.get("code", "")).strip()
+    data         = request.get_json(silent=True) or {}
+    email        = normalize_email(data.get("email", ""))
+    code         = str(data.get("code", "")).strip()
     new_password = str(data.get("newPassword", "")).strip()
 
     if not email or not code or not new_password:
@@ -663,26 +826,32 @@ def api_confirm_reset_password():
         auth_data = firebase_sign_in(email, new_password)
 
         user_doc = fs.collection("usuarios").document(uid).get()
-        profile = user_doc.to_dict() if user_doc.exists else {}
+        profile  = user_doc.to_dict() if user_doc.exists else {}
 
         user = {
-            "uid": uid,
-            "nombre": profile.get("nombre", ""),
-            "apellido": profile.get("apellido", ""),
+            "uid":           uid,
+            "nombre":        profile.get("nombre", ""),
+            "apellido":      profile.get("apellido", ""),
             "nombreCompleto": f"{profile.get('nombre', '')} {profile.get('apellido', '')}".strip(),
-            "email": profile.get("email", email),
-            "telefono": profile.get("telefono", ""),
-            "isAdmin": is_admin_uid(uid)
+            "email":         profile.get("email", email),
+            "telefono":      profile.get("telefono", ""),
+            "isAdmin":       is_admin_uid(uid)
         }
 
         doc_ref.delete()
-        return jsonify({"ok": True, "message": "Contraseña actualizada correctamente.", "token": auth_data.get("idToken"), "refreshToken": auth_data.get("refreshToken"), "user": user}), 200
+        return jsonify({
+            "ok": True,
+            "message": "Contraseña actualizada correctamente.",
+            "token": auth_data.get("idToken"),
+            "refreshToken": auth_data.get("refreshToken"),
+            "user": user
+        }), 200
     except Exception as e:
         return fail(f"No se pudo actualizar la contraseña: {e}", 500)
 
 @app.route("/api/auth/resend-reset-code", methods=["POST"])
 def api_resend_reset_code():
-    data = request.get_json(silent=True) or {}
+    data  = request.get_json(silent=True) or {}
     email = normalize_email(data.get("email", ""))
 
     if not email:
@@ -697,18 +866,31 @@ def api_resend_reset_code():
         get_firebase_user_by_email(email)
 
         code = generate_six_digit_code()
-        now = now_mx()
+        now  = now_mx()
         expires_at = now + timedelta(minutes=RESET_CODE_MINUTES)
 
         doc_ref.update({
-            "code": code,
-            "attempts": 0,
-            "verified": False,
-            "updated_at": now.isoformat(),
+            "code":           code,
+            "attempts":       0,
+            "verified":       False,
+            "updated_at":     now.isoformat(),
             "code_expires_at": expires_at.isoformat()
         })
 
-        send_reset_code_email(email, code)
+        # ✅ SMTP FIX
+        try:
+            send_reset_code_email(email, code)
+        except SmtpConfigError as e:
+            print(f"[SMTP CONFIG ERROR] {e}")
+            return fail(
+                "Error de configuración del servidor de correo. "
+                "Contacta al administrador.",
+                500
+            )
+        except SmtpSendError as e:
+            print(f"[SMTP SEND ERROR] {e}")
+            return fail(f"Error al reenviar el correo de recuperación: {e}", 502)
+
         return jsonify({"ok": True, "message": "Te enviamos un nuevo código de recuperación."}), 200
     except firebase_auth.UserNotFoundError:
         return fail("Correo no registrado.", 404)
@@ -720,8 +902,8 @@ def api_resend_reset_code():
 # =========================================================
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
-    data = request.get_json(silent=True) or {}
-    email = normalize_email(data.get("email", ""))
+    data     = request.get_json(silent=True) or {}
+    email    = normalize_email(data.get("email", ""))
     password = str(data.get("password", "")).strip()
 
     if not email or not password:
@@ -734,16 +916,22 @@ def api_login():
         profile = doc.to_dict() if doc.exists else {}
 
         user = {
-            "uid": uid,
-            "nombre": profile.get("nombre", ""),
-            "apellido": profile.get("apellido", ""),
+            "uid":           uid,
+            "nombre":        profile.get("nombre", ""),
+            "apellido":      profile.get("apellido", ""),
             "nombreCompleto": f"{profile.get('nombre', '')} {profile.get('apellido', '')}".strip(),
-            "email": profile.get("email", email),
-            "telefono": profile.get("telefono", ""),
-            "isAdmin": is_admin_uid(uid)
+            "email":         profile.get("email", email),
+            "telefono":      profile.get("telefono", ""),
+            "isAdmin":       is_admin_uid(uid)
         }
 
-        return jsonify({"ok": True, "message": "Inicio de sesión correcto", "token": auth_data.get("idToken"), "refreshToken": auth_data.get("refreshToken"), "user": user}), 200
+        return jsonify({
+            "ok": True,
+            "message": "Inicio de sesión correcto",
+            "token": auth_data.get("idToken"),
+            "refreshToken": auth_data.get("refreshToken"),
+            "user": user
+        }), 200
     except Exception as e:
         return fail(auth_error_message(str(e)), 400)
 
@@ -755,13 +943,13 @@ def api_me():
     profile = doc.to_dict() if doc.exists else {}
 
     user = {
-        "uid": uid,
-        "nombre": profile.get("nombre", ""),
-        "apellido": profile.get("apellido", ""),
+        "uid":           uid,
+        "nombre":        profile.get("nombre", ""),
+        "apellido":      profile.get("apellido", ""),
         "nombreCompleto": f"{profile.get('nombre', '')} {profile.get('apellido', '')}".strip(),
-        "email": profile.get("email", request.user.get("email", "")),
-        "telefono": profile.get("telefono", ""),
-        "isAdmin": request.user_is_admin
+        "email":         profile.get("email", request.user.get("email", "")),
+        "telefono":      profile.get("telefono", ""),
+        "isAdmin":       request.user_is_admin
     }
 
     return jsonify({"ok": True, "user": user}), 200
@@ -772,12 +960,12 @@ def api_me():
 @app.route("/api/orders", methods=["POST"])
 @require_auth(admin=False)
 def api_create_order_client():
-    data = request.get_json(silent=True) or {}
-    tipo_prenda = str(data.get("tipoPrenda", "")).strip()
-    material = str(data.get("material", "")).strip()
-    cantidad = int(data.get("cantidad", 1))
+    data         = request.get_json(silent=True) or {}
+    tipo_prenda  = str(data.get("tipoPrenda", "")).strip()
+    material     = str(data.get("material", "")).strip()
+    cantidad     = int(data.get("cantidad", 1))
     fecha_entrega = str(data.get("fechaEntrega", "")).strip()
-    notas = str(data.get("notas", "")).strip()
+    notas        = str(data.get("notas", "")).strip()
 
     if not tipo_prenda:
         return fail("Debes indicar la prenda", 400)
@@ -787,10 +975,10 @@ def api_create_order_client():
         return fail("Debes indicar la fecha de entrega", 400)
 
     uid = request.user_uid
-    user_doc = fs.collection("usuarios").document(uid).get()
+    user_doc  = fs.collection("usuarios").document(uid).get()
     user_data = user_doc.to_dict() if user_doc.exists else {}
 
-    nombre = user_data.get("nombre", "")
+    nombre  = user_data.get("nombre", "")
     apellido = user_data.get("apellido", "")
     cliente_nombre = f"{nombre} {apellido}".strip() or request.user.get("email", "")
 
@@ -820,7 +1008,7 @@ def api_create_order_client():
         "hmi_activated_at": "",
         "started_at": "",
         "completed_at": "",
-        "planchado_completado_at": "",  # ✅ NUEVO
+        "planchado_completado_at": "",
         "ultimo_error": "",
         "created_at": ahora,
         "updated_at": ahora
@@ -834,7 +1022,7 @@ def api_create_order_client():
 @app.route("/api/orders/my", methods=["GET"])
 @require_auth(admin=False)
 def api_orders_my():
-    uid = request.user_uid
+    uid  = request.user_uid
     docs = fs.collection("pedidos").where("clienteUid", "==", uid).stream()
     items = [order_doc_to_json(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
@@ -843,7 +1031,7 @@ def api_orders_my():
 @app.route("/api/orders/track/<folio>", methods=["GET"])
 def api_orders_track(folio):
     folio = str(folio).strip().upper()
-    docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
+    docs  = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
     if not docs:
         return fail(f"No se encontró ningún pedido con ID {folio}", 404)
     return jsonify({"ok": True, "order": order_doc_to_json(docs[0])}), 200
@@ -854,7 +1042,7 @@ def api_orders_track(folio):
 @app.route("/api/admin/orders", methods=["GET"])
 @require_auth(admin=True)
 def api_admin_orders_list():
-    docs = fs.collection("pedidos").stream()
+    docs  = fs.collection("pedidos").stream()
     items = [order_doc_to_json(doc) for doc in docs]
     items.sort(key=lambda x: x.get("Contador", 0), reverse=True)
     return jsonify({"ok": True, "orders": items}), 200
@@ -862,16 +1050,16 @@ def api_admin_orders_list():
 @app.route("/api/admin/orders", methods=["POST"])
 @require_auth(admin=True)
 def api_admin_orders_create():
-    data = request.get_json(silent=True) or {}
-    cliente = str(data.get("cliente", "")).strip()
-    telefono = str(data.get("telefono", "")).strip()
-    tipo_prenda = str(data.get("tipoPrenda", "")).strip()
-    material = str(data.get("material", "")).strip()
-    cantidad = int(data.get("cantidad", 1))
-    precio = data.get("precio", None)
+    data         = request.get_json(silent=True) or {}
+    cliente      = str(data.get("cliente", "")).strip()
+    telefono     = str(data.get("telefono", "")).strip()
+    tipo_prenda  = str(data.get("tipoPrenda", "")).strip()
+    material     = str(data.get("material", "")).strip()
+    cantidad     = int(data.get("cantidad", 1))
+    precio       = data.get("precio", None)
     fecha_ingreso = str(data.get("fechaIngreso", "")).strip()
     fecha_entrega = str(data.get("FechaEntrega", "")).strip()
-    notas = str(data.get("notas", "")).strip()
+    notas        = str(data.get("notas", "")).strip()
 
     if not cliente:
         return fail("El nombre del cliente es obligatorio", 400)
@@ -908,7 +1096,7 @@ def api_admin_orders_create():
         "hmi_activated_at": "",
         "started_at": "",
         "completed_at": "",
-        "planchado_completado_at": "",  # ✅ NUEVO
+        "planchado_completado_at": "",
         "ultimo_error": "",
         "created_at": ahora,
         "updated_at": ahora
@@ -927,7 +1115,8 @@ def api_admin_orders_update(order_id):
         return fail("Pedido no encontrado", 404)
 
     data = request.get_json(silent=True) or {}
-    allowed_keys = {"cliente", "telefono", "tipoPrenda", "material", "cantidad", "precio", "fechaIngreso", "FechaEntrega", "notas", "Estado"}
+    allowed_keys = {"cliente", "telefono", "tipoPrenda", "material", "cantidad",
+                    "precio", "fechaIngreso", "FechaEntrega", "notas", "Estado"}
     payload = {key: value for key, value in data.items() if key in allowed_keys}
 
     if "Estado" in payload:
@@ -951,13 +1140,13 @@ def api_admin_orders_delete(order_id):
 @app.route("/api/admin/clients", methods=["GET"])
 @require_auth(admin=True)
 def api_admin_clients():
-    user_docs = list(fs.collection("usuarios").stream())
+    user_docs  = list(fs.collection("usuarios").stream())
     order_docs = list(fs.collection("pedidos").stream())
 
     count_by_uid = {}
     for doc in order_docs:
         data = doc.to_dict() or {}
-        uid = data.get("clienteUid", "")
+        uid  = data.get("clienteUid", "")
         if uid:
             count_by_uid[uid] = count_by_uid.get(uid, 0) + 1
 
@@ -976,19 +1165,19 @@ def api_admin_clients():
 @app.route("/api/worker/activate-by-folio/<folio>", methods=["POST"])
 def api_worker_activate_by_folio(folio):
     folio = str(folio).strip().upper()
-    docs = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
+    docs  = list(fs.collection("pedidos").where("Folio", "==", folio).stream())
     if not docs:
         return fail(f"No se encontró ningún pedido con ID {folio}", 404)
 
-    doc = docs[0]
+    doc     = docs[0]
     doc_ref = fs.collection("pedidos").document(doc.id)
-    snap = doc_ref.get()
-    data = snap.to_dict() or {}
+    snap    = doc_ref.get()
+    data    = snap.to_dict() or {}
 
     payload = {
-        "activado_hmi": True,
+        "activado_hmi":    True,
         "hmi_activated_at": now_mx().isoformat(),
-        "updated_at": now_mx().isoformat()
+        "updated_at":      now_mx().isoformat()
     }
 
     if data.get("Estado", "pendiente") == "pendiente":
@@ -1011,7 +1200,7 @@ def api_worker_activate_by_folio(folio):
 
 @app.route("/api/worker/active-order", methods=["GET"])
 def api_worker_active_order():
-    current_order_id = str(estado_memoria.get("current_order_id", "")).strip()
+    current_order_id    = str(estado_memoria.get("current_order_id", "")).strip()
     current_order_folio = str(estado_memoria.get("current_order_folio", "")).strip()
 
     if not current_order_id:
@@ -1031,7 +1220,7 @@ def api_worker_active_order():
 
 @app.route("/api/worker/next-order", methods=["GET"])
 def api_worker_next_order():
-    docs = fs.collection("pedidos").where("Estado", "==", "pendiente").where("activado_hmi", "==", True).stream()
+    docs  = fs.collection("pedidos").where("Estado", "==", "pendiente").where("activado_hmi", "==", True).stream()
     items = []
 
     for doc in docs:
@@ -1055,15 +1244,20 @@ def api_worker_order_start(order_id):
         return fail("Pedido no encontrado", 404)
 
     doc_ref.update({
-        "Estado": "en_proceso",
+        "Estado":       "en_proceso",
         "rutina_activa": True,
-        "started_at": now_mx().isoformat(),
-        "updated_at": now_mx().isoformat()
+        "started_at":   now_mx().isoformat(),
+        "updated_at":   now_mx().isoformat()
     })
 
     snap2 = doc_ref.get()
     order = order_doc_to_json(snap2)
-    guardar_estado(activo=True, estado=f"Pedido iniciado: {order.get('Folio', '')}", current_order_id=order_id, current_order_folio=order.get("Folio", ""))
+    guardar_estado(
+        activo=True,
+        estado=f"Pedido iniciado: {order.get('Folio', '')}",
+        current_order_id=order_id,
+        current_order_folio=order.get("Folio", "")
+    )
     return jsonify({"ok": True, "message": "Pedido iniciado"}), 200
 
 @app.route("/api/worker/orders/<order_id>/status", methods=["POST"])
@@ -1073,10 +1267,9 @@ def api_worker_order_status(order_id):
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
-    data = request.get_json(silent=True) or {}
+    data   = request.get_json(silent=True) or {}
     estado = str(data.get("Estado", data.get("estado", ""))).strip()
 
-    # ✅ NUEVO: "listo_para_entrega" agregado a los estados válidos
     estados_validos = {"pendiente", "en_proceso", "planchado", "listo_para_entrega", "listo", "entregado"}
 
     if not estado:
@@ -1088,20 +1281,18 @@ def api_worker_order_status(order_id):
 
     if estado == "en_proceso":
         payload["rutina_activa"] = True
-        payload["started_at"] = now_mx().isoformat()
+        payload["started_at"]   = now_mx().isoformat()
     if estado == "planchado":
         payload["rutina_activa"] = True
-    # ✅ NUEVO: listo_para_entrega = planchado físicamente terminado, en espera de confirmación final
     if estado == "listo_para_entrega":
-        payload["rutina_activa"] = False
+        payload["rutina_activa"]          = False
         payload["planchado_completado_at"] = now_mx().isoformat()
     if estado == "listo":
         payload["rutina_activa"] = False
         payload["completed_at"] = now_mx().isoformat()
     if estado == "entregado":
         payload["rutina_activa"] = False
-        payload["Validado"] = True
-    # ✅ NUEVO: listo_para_entrega no es entregado, así que Validado = False
+        payload["Validado"]      = True
     if estado in {"pendiente", "en_proceso", "planchado", "listo_para_entrega", "listo"}:
         payload["Validado"] = False
 
@@ -1109,7 +1300,6 @@ def api_worker_order_status(order_id):
     snap2 = doc_ref.get()
     order = order_doc_to_json(snap2)
 
-    # ✅ NUEVO: listo_para_entrega mantiene el pedido activo en memoria (aún no terminó el flujo completo)
     if estado == "entregado":
         guardar_estado(
             activo=False,
@@ -1132,7 +1322,12 @@ def api_worker_order_status(order_id):
             current_order_folio=order.get("Folio", "")
         )
 
-    return jsonify({"ok": True, "message": f"Estado actualizado a {estado}", "order_id": order_id, "Estado": estado}), 200
+    return jsonify({
+        "ok": True,
+        "message": f"Estado actualizado a {estado}",
+        "order_id": order_id,
+        "Estado": estado
+    }), 200
 
 @app.route("/api/worker/orders/<order_id>/photo", methods=["POST"])
 def api_worker_order_photo(order_id):
@@ -1150,14 +1345,14 @@ def api_worker_order_photo(order_id):
         if archivo.filename == "":
             return fail("Archivo vacío", 400)
 
-        now = now_mx()
+        now   = now_mx()
         fecha = now.strftime("%Y-%m-%d")
-        hora = now.strftime("%H:%M:%S")
+        hora  = now.strftime("%H:%M:%S")
         stamp = now.strftime("%Y%m%d_%H%M%S_%f")
 
         nombre_seguro = secure_filename(archivo.filename)
-        nombre_final = f"{order_id}_{stamp}_{nombre_seguro}"
-        ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+        nombre_final  = f"{order_id}_{stamp}_{nombre_seguro}"
+        ruta_local    = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
@@ -1169,32 +1364,29 @@ def api_worker_order_photo(order_id):
 
         content_type = archivo.mimetype or "image/jpeg"
         bucket = storage.bucket()
-        blob = bucket.blob(f"pedidos/{order_id}/{nombre_final}")
+        blob   = bucket.blob(f"pedidos/{order_id}/{nombre_final}")
         blob.upload_from_filename(ruta_local, content_type=content_type)
         blob.make_public()
 
         foto_info = {
-            "nombre": nombre_final,
-            "url": blob.public_url,
+            "nombre":       nombre_final,
+            "url":          blob.public_url,
             "content_type": content_type,
-            "fecha": fecha,
-            "hora": hora,
-            "fecha_hora": f"{fecha} {hora}",
-            "timestamp": now.isoformat(),
-            "size_bytes": tam,
+            "fecha":        fecha,
+            "hora":         hora,
+            "fecha_hora":   f"{fecha} {hora}",
+            "timestamp":    now.isoformat(),
+            "size_bytes":   tam,
             "storage_path": blob.name
         }
 
-        data = snap.to_dict() or {}
+        data  = snap.to_dict() or {}
         fotos = data.get("fotos", [])
         if not isinstance(fotos, list):
             fotos = []
         fotos.append(foto_info)
 
-        doc_ref.update({
-            "fotos": fotos,
-            "updated_at": now.isoformat()
-        })
+        doc_ref.update({"fotos": fotos, "updated_at": now.isoformat()})
 
         try:
             fotos_ref.push({"order_id": order_id, **foto_info})
@@ -1219,15 +1411,20 @@ def api_worker_order_complete(order_id):
         return fail("Pedido no encontrado", 404)
 
     doc_ref.update({
-        "Estado": "listo",
+        "Estado":       "listo",
         "rutina_activa": False,
         "completed_at": now_mx().isoformat(),
-        "updated_at": now_mx().isoformat()
+        "updated_at":   now_mx().isoformat()
     })
 
     snap2 = doc_ref.get()
     order = order_doc_to_json(snap2)
-    guardar_estado(activo=False, estado=f"Pedido completado: {order.get('Folio', '')}", current_order_id=order_id, current_order_folio=order.get("Folio", ""))
+    guardar_estado(
+        activo=False,
+        estado=f"Pedido completado: {order.get('Folio', '')}",
+        current_order_id=order_id,
+        current_order_folio=order.get("Folio", "")
+    )
     return jsonify({"ok": True, "message": "Pedido completado"}), 200
 
 @app.route("/api/worker/orders/<order_id>/error", methods=["POST"])
@@ -1237,19 +1434,24 @@ def api_worker_order_error(order_id):
     if not snap.exists:
         return fail("Pedido no encontrado", 404)
 
-    data = request.get_json(silent=True) or {}
+    data      = request.get_json(silent=True) or {}
     error_msg = str(data.get("error", "Error no especificado"))
 
     doc_ref.update({
-        "Estado": "pendiente",
+        "Estado":       "pendiente",
         "rutina_activa": False,
         "ultimo_error": error_msg,
-        "updated_at": now_mx().isoformat()
+        "updated_at":   now_mx().isoformat()
     })
 
     snap2 = doc_ref.get()
     order = order_doc_to_json(snap2)
-    guardar_estado(activo=False, estado=f"Error en pedido: {order.get('Folio', '')}", current_order_id=order_id, current_order_folio=order.get("Folio", ""))
+    guardar_estado(
+        activo=False,
+        estado=f"Error en pedido: {order.get('Folio', '')}",
+        current_order_id=order_id,
+        current_order_folio=order.get("Folio", "")
+    )
     return jsonify({"ok": True, "message": "Error registrado"}), 200
 
 # =========================================================
@@ -1265,7 +1467,7 @@ def obtener_estado():
 
 @app.route("/set_usuario", methods=["POST"])
 def set_usuario():
-    data = request.get_json(silent=True) or {}
+    data    = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
     if not usuario or not usuario.isdigit() or len(usuario) > 5:
         return fail("Usuario inválido, máximo 5 dígitos", 400)
@@ -1275,7 +1477,7 @@ def set_usuario():
 
 @app.route("/set_cantidad", methods=["POST"])
 def set_cantidad():
-    data = request.get_json(silent=True) or {}
+    data    = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
     cantidad = data.get("cantidad", None)
 
@@ -1284,12 +1486,17 @@ def set_cantidad():
     if not isinstance(cantidad, int) or cantidad < 0:
         return fail("Cantidad inválida", 400)
 
-    guardar_estado(usuario=usuario, cantidad=cantidad, activo=(cantidad > 0), estado=f"Usuario {usuario}: cantidad actualizada a {cantidad}")
+    guardar_estado(
+        usuario=usuario,
+        cantidad=cantidad,
+        activo=(cantidad > 0),
+        estado=f"Usuario {usuario}: cantidad actualizada a {cantidad}"
+    )
     return jsonify({"ok": True, "message": "Cantidad actualizada correctamente", "data": estado_memoria}), 200
 
 @app.route("/activar_plc", methods=["POST"])
 def activar_plc():
-    data = request.get_json(silent=True) or {}
+    data    = request.get_json(silent=True) or {}
     usuario = str(data.get("usuario", "")).strip()
     if not usuario:
         return fail("Debes enviar usuario", 400)
@@ -1317,14 +1524,14 @@ def subir_foto():
         if archivo.filename == "":
             return fail("Archivo vacío", 400)
 
-        now = now_mx()
+        now   = now_mx()
         fecha = now.strftime("%Y-%m-%d")
-        hora = now.strftime("%H:%M:%S")
+        hora  = now.strftime("%H:%M:%S")
         stamp = now.strftime("%Y%m%d_%H%M%S_%f")
 
         nombre_seguro = secure_filename(archivo.filename)
-        nombre_final = f"u{usuario}_{stamp}_{nombre_seguro}"
-        ruta_local = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
+        nombre_final  = f"u{usuario}_{stamp}_{nombre_seguro}"
+        ruta_local    = os.path.join(app.config["UPLOAD_FOLDER"], nombre_final)
         archivo.save(ruta_local)
 
         if not os.path.exists(ruta_local):
@@ -1336,20 +1543,20 @@ def subir_foto():
 
         content_type = archivo.mimetype or "image/jpeg"
         bucket = storage.bucket()
-        blob = bucket.blob(f"usuarios/{usuario}/{nombre_final}")
+        blob   = bucket.blob(f"usuarios/{usuario}/{nombre_final}")
         blob.upload_from_filename(ruta_local, content_type=content_type)
         blob.make_public()
 
         foto_info = {
-            "usuario": usuario,
-            "nombre": nombre_final,
-            "url": blob.public_url,
+            "usuario":      usuario,
+            "nombre":       nombre_final,
+            "url":          blob.public_url,
             "content_type": content_type,
-            "fecha": fecha,
-            "hora": hora,
-            "etiqueta": f"{usuario}_{fecha}_{hora}",
-            "timestamp": now.isoformat(),
-            "size_bytes": tam,
+            "fecha":        fecha,
+            "hora":         hora,
+            "etiqueta":     f"{usuario}_{fecha}_{hora}",
+            "timestamp":    now.isoformat(),
+            "size_bytes":   tam,
             "storage_path": blob.name
         }
 
@@ -1370,7 +1577,7 @@ def fotos_usuario(usuario):
     if not usuario.isdigit() or len(usuario) > 5:
         return fail("Usuario inválido", 400)
 
-    data = fotos_ref.get() or {}
+    data  = fotos_ref.get() or {}
     items = [item for _, item in data.items() if str(item.get("usuario", "")).strip() == usuario]
     items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return jsonify({"ok": True, "fotos": items}), 200
